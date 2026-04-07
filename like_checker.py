@@ -171,12 +171,28 @@ class HistoryDB:
                 not_liked_count INTEGER,
                 like_pct    REAL,
                 liked_names TEXT,
-                not_liked_names TEXT
+                not_liked_names TEXT,
+                UNIQUE(group_id, message_id)
             );
             CREATE INDEX IF NOT EXISTS idx_checks_group ON checks(group_id);
             CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts);
         """)
         self.conn.commit()
+        # Migrate: deduplicate any existing rows from before the unique constraint
+        self._deduplicate()
+
+    def _deduplicate(self):
+        """One-time migration: remove duplicate rows for the same group+message,
+        keeping only the most recent check per message."""
+        try:
+            self.conn.execute("""
+                DELETE FROM checks WHERE id NOT IN (
+                    SELECT MAX(id) FROM checks GROUP BY group_id, message_id
+                )
+            """)
+            self.conn.commit()
+        except Exception:
+            pass
 
     def close(self):
         try:
@@ -200,7 +216,7 @@ class HistoryDB:
     ):
         with self._lock:
             self.conn.execute(
-                """INSERT INTO checks
+                """INSERT OR REPLACE INTO checks
                    (ts, group_id, group_name, message_id, message_text, sender,
                     total_members, liked_count, not_liked_count, like_pct,
                     liked_names, not_liked_names)

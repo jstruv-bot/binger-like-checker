@@ -16,14 +16,18 @@ Get your API token at: https://dev.groupme.com
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import threading
 import json
 import os
+import re
 import sqlite3
+import time
 import uuid
 import webbrowser
 from datetime import datetime, timedelta
-from collections import Counter, defaultdict
+from collections import Counter
 
 API_BASE = "https://api.groupme.com/v3"
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".binger")
@@ -63,12 +67,23 @@ C = {
 class GroupMeAPI:
     def __init__(self, token):
         self.token = token
+        # Persistent session with connection pooling and automatic retries
+        self.session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def _get(self, endpoint, params=None):
         if params is None:
             params = {}
         params["token"] = self.token
-        r = requests.get(f"{API_BASE}{endpoint}", params=params, timeout=15)
+        r = self.session.get(f"{API_BASE}{endpoint}", params=params, timeout=15)
         r.raise_for_status()
         return r.json().get("response")
 
@@ -89,7 +104,7 @@ class GroupMeAPI:
 
     def send_message(self, gid, text):
         payload = {"message": {"source_guid": str(uuid.uuid4()), "text": text}}
-        r = requests.post(
+        r = self.session.post(
             f"{API_BASE}/groups/{gid}/messages",
             params={"token": self.token},
             json=payload,
@@ -136,7 +151,9 @@ def save_config(data):
 class HistoryDB:
     def __init__(self):
         _ensure_dir()
+        self._lock = threading.Lock()
         self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")  # faster concurrent reads
         self._create_tables()
 
     def _create_tables(self):
@@ -156,8 +173,16 @@ class HistoryDB:
                 liked_names TEXT,
                 not_liked_names TEXT
             );
+            CREATE INDEX IF NOT EXISTS idx_checks_group ON checks(group_id);
+            CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts);
         """)
         self.conn.commit()
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
     def save_check(
         self,
@@ -173,46 +198,49 @@ class HistoryDB:
         liked_names,
         not_liked_names,
     ):
-        self.conn.execute(
-            """INSERT INTO checks
-               (ts, group_id, group_name, message_id, message_text, sender,
-                total_members, liked_count, not_liked_count, like_pct,
-                liked_names, not_liked_names)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                datetime.now().isoformat(),
-                group_id,
-                group_name,
-                message_id,
-                message_text,
-                sender,
-                total_members,
-                liked_count,
-                not_liked_count,
-                like_pct,
-                json.dumps(liked_names),
-                json.dumps(not_liked_names),
-            ),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO checks
+                   (ts, group_id, group_name, message_id, message_text, sender,
+                    total_members, liked_count, not_liked_count, like_pct,
+                    liked_names, not_liked_names)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    datetime.now().isoformat(),
+                    group_id,
+                    group_name,
+                    message_id,
+                    message_text,
+                    sender,
+                    total_members,
+                    liked_count,
+                    not_liked_count,
+                    like_pct,
+                    json.dumps(liked_names),
+                    json.dumps(not_liked_names),
+                ),
+            )
+            self.conn.commit()
 
     def get_history(self, group_id=None, limit=100):
-        if group_id:
-            rows = self.conn.execute(
-                "SELECT * FROM checks WHERE group_id=? ORDER BY ts DESC LIMIT ?",
-                (group_id, limit),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT * FROM checks ORDER BY ts DESC LIMIT ?", (limit,)
-            ).fetchall()
+        with self._lock:
+            if group_id:
+                rows = self.conn.execute(
+                    "SELECT * FROM checks WHERE group_id=? ORDER BY ts DESC LIMIT ?",
+                    (group_id, limit),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM checks ORDER BY ts DESC LIMIT ?", (limit,)
+                ).fetchall()
         return rows
 
     def get_repeat_offenders(self, group_id, limit=20):
         """Members who appear most often in not_liked_names."""
-        rows = self.conn.execute(
-            "SELECT not_liked_names FROM checks WHERE group_id=?", (group_id,)
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT not_liked_names FROM checks WHERE group_id=?", (group_id,)
+            ).fetchall()
         counter = Counter()
         for (names_json,) in rows:
             try:
@@ -228,23 +256,44 @@ class HistoryDB:
 # ─────────────────────────────────────────────────────────────────────
 
 
+# Cache winotify availability so we don't re-check every call
+_winotify_cls = None
+_winotify_checked = False
+
+
+def _sanitize_ps(s):
+    """Remove characters that could break or inject into a PowerShell string."""
+    return re.sub(r'["`$\r\n]', "", str(s))
+
+
 def send_toast(title, message):
     """Best-effort Windows toast notification."""
-    try:
-        from tkinter import Tk
+    global _winotify_cls, _winotify_checked
 
-        # Try winotify first
-        from winotify import Notification
+    # Try winotify (cached check)
+    if not _winotify_checked:
+        try:
+            from winotify import Notification
 
-        n = Notification(app_id="Binger Like Checker", title=title, msg=message)
-        n.show()
-        return True
-    except ImportError:
-        pass
+            _winotify_cls = Notification
+        except ImportError:
+            _winotify_cls = None
+        _winotify_checked = True
+
+    if _winotify_cls is not None:
+        try:
+            n = _winotify_cls(app_id="Binger Like Checker", title=title, msg=message)
+            n.show()
+            return True
+        except Exception:
+            pass
+
+    # Fallback: PowerShell native toast (sanitized inputs)
     try:
-        # Fallback: PowerShell BurntToast or native
         import subprocess
 
+        safe_title = _sanitize_ps(title)
+        safe_msg = _sanitize_ps(message)
         ps = (
             f"[Windows.UI.Notifications.ToastNotificationManager, "
             f"Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
@@ -252,8 +301,8 @@ def send_toast(title, message):
             f"::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]"
             f"::ToastText02); "
             f'$texts = $xml.GetElementsByTagName("text"); '
-            f'$texts[0].AppendChild($xml.CreateTextNode("{title}")) | Out-Null; '
-            f'$texts[1].AppendChild($xml.CreateTextNode("{message}")) | Out-Null; '
+            f'$texts[0].AppendChild($xml.CreateTextNode("{safe_title}")) | Out-Null; '
+            f'$texts[1].AppendChild($xml.CreateTextNode("{safe_msg}")) | Out-Null; '
             f"$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
             f"[Windows.UI.Notifications.ToastNotificationManager]"
             f'::CreateToastNotifier("Binger Like Checker").Show($toast)'
@@ -314,6 +363,8 @@ class BingerApp:
         self.selected_message = None
         self.user_name = None
         self.excluded_user_ids = set()
+        self._msg_cache = {}  # group_id -> (timestamp, messages) for reuse
+        self._cache_ttl = 120  # seconds before cache is stale
         self.db = HistoryDB()
 
         self._apply_theme()
@@ -602,8 +653,18 @@ class BingerApp:
         return t
 
     def _tw(self, widget, text, tag=None):
+        """Write a single chunk to a text widget. For bulk writes, use _tw_batch."""
         widget.config(state="normal")
         widget.insert(tk.END, text, tag if tag else ())
+        widget.config(state="disabled")
+        widget.see(tk.END)
+
+    def _tw_batch(self, widget, chunks):
+        """Write many (text, tag) chunks at once -- much faster than individual _tw calls.
+        chunks: list of (text, tag_or_None) tuples."""
+        widget.config(state="normal")
+        for text, tag in chunks:
+            widget.insert(tk.END, text, tag if tag else ())
         widget.config(state="disabled")
         widget.see(tk.END)
 
@@ -1053,6 +1114,18 @@ class BingerApp:
         excl_count = len([1 for v in check_vars.values() if v.get()])
         ttk.Button(btn_frame, text="Apply", command=apply_excl).pack(side=tk.RIGHT)
 
+    # ──────────────── MESSAGE CACHE ────────────────
+    def _get_cached_or_fetch(self, gid, count, progress_cb=None):
+        """Return cached messages if fresh enough and large enough, else fetch."""
+        cached = self._msg_cache.get(gid)
+        if cached:
+            ts, msgs = cached
+            if time.time() - ts < self._cache_ttl and len(msgs) >= count:
+                return msgs[:count]
+        msgs = fetch_messages_bulk(self.api, gid, count, progress_cb)
+        self._msg_cache[gid] = (time.time(), msgs)
+        return msgs
+
     # ──────────────── LOAD MESSAGES ────────────────
     def _load_messages(self):
         if not self.selected_group:
@@ -1087,32 +1160,36 @@ class BingerApp:
         self._hide_progress()
         self.msg_listbox.delete(0, tk.END)
         self._display_messages = list(self.messages)
-        for m in self._display_messages:
-            self._insert_msg_row(m)
+        # Batch insert all rows at once to avoid per-item overhead
+        rows = [self._format_msg_row(m) for m in self._display_messages]
+        self.msg_listbox.insert(tk.END, *rows)
         self.load_msgs_btn.config(state="normal")
         self.msg_count_var.set(f"{len(self.messages)} msgs")
         self._status(f"Loaded {len(self.messages)} messages")
 
-    def _insert_msg_row(self, msg):
+    @staticmethod
+    def _format_msg_row(msg):
+        """Format a message dict into a listbox display string."""
         ts = datetime.fromtimestamp(msg.get("created_at", 0)).strftime("%m/%d %H:%M")
         name = msg.get("name", "???")[:14].ljust(14)
         text = (msg.get("text") or "(attachment)")[:50].replace("\n", " ")
         likes = len(msg.get("favorited_by", []))
         h = "+" if likes > 0 else " "
-        self.msg_listbox.insert(
-            tk.END, f" [{ts}] {name} {h}{str(likes).rjust(2)}L  {text}"
-        )
+        return f" [{ts}] {name} {h}{str(likes).rjust(2)}L  {text}"
 
     def _filter_messages(self, *args):
         q = self.search_var.get().strip().lower()
         self.msg_listbox.delete(0, tk.END)
         self._display_messages = []
+        rows = []
         for m in self.messages:
             t = (m.get("text") or "").lower()
             n = (m.get("name") or "").lower()
             if q in t or q in n:
                 self._display_messages.append(m)
-                self._insert_msg_row(m)
+                rows.append(self._format_msg_row(m))
+        if rows:
+            self.msg_listbox.insert(tk.END, *rows)
 
     def _on_message_selected(self, event):
         sel = self.msg_listbox.curselection()
@@ -1174,7 +1251,8 @@ class BingerApp:
         lk = len(liked)
         pct = (lk / total * 100) if total > 0 else 0
 
-        W = lambda t, tag=None: self._tw(self.results_text, t, tag)
+        out = []
+        W = lambda t, tag=None: out.append((t, tag))
 
         W("MESSAGE\n", "header")
         W("-" * 52 + "\n", "sep")
@@ -1218,6 +1296,7 @@ class BingerApp:
             for i, n in enumerate(excluded_names, 1):
                 W(f"  {i:>3}. {n}\n", "dim")
 
+        self._tw_batch(self.results_text, out)
         self._status(f"Result: {nl} didn't like | {lk} liked | {pct:.0f}%")
         self.copy_btn.config(state="normal")
         self.export_btn.config(state="normal")
@@ -1339,7 +1418,7 @@ class BingerApp:
                         0, lambda: self.lb_status_var.set(f"Fetching... {n} msgs")
                     )
 
-                msgs = fetch_messages_bulk(self.api, gid, count, pcb)
+                msgs = self._get_cached_or_fetch(gid, count, pcb)
                 self.root.after(0, lambda: self._render_leaderboard(msgs))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -1352,7 +1431,8 @@ class BingerApp:
         self._hide_progress()
         self.lb_run_btn.config(state="normal")
         self._tc(self.lb_text)
-        W = lambda t, tag=None: self._tw(self.lb_text, t, tag)
+        out = []  # collect (text, tag) for batch write
+        W = lambda t, tag=None: out.append((t, tag))
 
         mm = self._get_member_map(self.selected_group)
 
@@ -1424,6 +1504,8 @@ class BingerApp:
             prefix = ["1st", "2nd", "3rd"][i] if i < 3 else f"{i + 1:>3}"
             W(f"  {prefix.rjust(3)}  {mm[uid]:<20} {cnt:>5} messages\n", tag)
 
+        self._tw_batch(self.lb_text, out)
+
     # ════════════════════════════════════════════════════════
     #  HISTORY
     # ════════════════════════════════════════════════════════
@@ -1431,7 +1513,8 @@ class BingerApp:
         if not self.selected_group:
             return
         self._tc(self.hist_text)
-        W = lambda t, tag=None: self._tw(self.hist_text, t, tag)
+        out = []
+        W = lambda t, tag=None: out.append((t, tag))
 
         rows = self.db.get_history(self.selected_group["id"], limit=50)
         W(f"CHECK HISTORY  ({self.selected_group['name']})\n", "header")
@@ -1439,6 +1522,7 @@ class BingerApp:
 
         if not rows:
             W("  No checks recorded yet. Run a like check first.\n", "dim")
+            self._tw_batch(self.hist_text, out)
             return
 
         for row in rows:
@@ -1475,11 +1559,14 @@ class BingerApp:
                 pass
             W("\n")
 
+        self._tw_batch(self.hist_text, out)
+
     def _show_offenders(self):
         if not self.selected_group:
             return
         self._tc(self.hist_text)
-        W = lambda t, tag=None: self._tw(self.hist_text, t, tag)
+        out = []
+        W = lambda t, tag=None: out.append((t, tag))
 
         offenders = self.db.get_repeat_offenders(self.selected_group["id"], limit=30)
         W(f"REPEAT OFFENDERS  ({self.selected_group['name']})\n", "header")
@@ -1488,6 +1575,7 @@ class BingerApp:
 
         if not offenders:
             W("  No data yet. Run some like checks first.\n", "dim")
+            self._tw_batch(self.hist_text, out)
             return
 
         medal = {0: "gold", 1: "silver", 2: "bronze"}
@@ -1495,6 +1583,8 @@ class BingerApp:
             tag = medal.get(i, "not_liked" if i < 5 else "dim")
             prefix = ["1st", "2nd", "3rd"][i] if i < 3 else f"{i + 1:>3}"
             W(f"  {prefix.rjust(3)}  {name:<24} {count:>4} time(s)\n", tag)
+
+        self._tw_batch(self.hist_text, out)
 
     # ════════════════════════════════════════════════════════
     #  ANALYTICS
@@ -1518,7 +1608,7 @@ class BingerApp:
                         0, lambda: self.an_status_var.set(f"Fetching... {n} msgs")
                     )
 
-                msgs = fetch_messages_bulk(self.api, gid, count, pcb)
+                msgs = self._get_cached_or_fetch(gid, count, pcb)
                 self.root.after(0, lambda: self._render_analytics(msgs))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -1531,12 +1621,13 @@ class BingerApp:
         self._hide_progress()
         self.an_run_btn.config(state="normal")
         self._tc(self.an_text)
-        W = lambda t, tag=None: self._tw(self.an_text, t, tag)
+        out = []  # collect (text, tag) for batch write
+        W = lambda t, tag=None: out.append((t, tag))
 
         mm = self._get_member_map(self.selected_group)
         total = len(msgs)
         if total == 0:
-            W("  No messages to analyze.\n", "dim")
+            self._tw(self.an_text, "  No messages to analyze.\n", "dim")
             return
 
         self.an_status_var.set(f"Analyzed {total} messages")
@@ -1666,6 +1757,8 @@ class BingerApp:
                 tag,
             )
 
+        self._tw_batch(self.an_text, out)
+
     # ════════════════════════════════════════════════════════
     #  NOTIFICATIONS
     # ════════════════════════════════════════════════════════
@@ -1682,12 +1775,32 @@ class BingerApp:
 
 # ═════════════════════════════════════════════════════════════════════
 def main():
+    # Enable DPI awareness for sharp rendering on high-DPI displays
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+    except Exception:
+        try:
+            import ctypes
+
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
     root = tk.Tk()
     try:
         root.iconbitmap(default="")
     except Exception:
         pass
     app = BingerApp(root)
+
+    # Graceful shutdown: close DB on exit
+    def on_close():
+        app.db.close()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
 

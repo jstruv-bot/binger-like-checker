@@ -18,6 +18,9 @@ from tkinter import ttk, messagebox, scrolledtext, filedialog
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import platform
+import subprocess
+import sys
 import threading
 import json
 import os
@@ -28,6 +31,10 @@ import uuid
 import webbrowser
 from datetime import datetime, timedelta
 from collections import Counter
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
 
 API_BASE = "https://api.groupme.com/v3"
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".binger")
@@ -302,67 +309,89 @@ class HistoryDB:
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Notifications (Windows toast)
+#  Notifications (cross-platform)
 # ─────────────────────────────────────────────────────────────────────
 
 
-# Cache winotify availability so we don't re-check every call
-_winotify_cls = None
-_winotify_checked = False
+# Cache notification library availability
+_notif_lib = None
+_notif_checked = False
 
 
-def _sanitize_ps(s):
-    """Remove characters that could break or inject into a PowerShell string."""
-    return re.sub(r'["`$\r\n]', "", str(s))
+def _sanitize_shell(s):
+    """Remove characters that could break shell strings."""
+    return re.sub(r'["`$\r\n\\\']', "", str(s))
 
 
 def send_toast(title, message):
-    """Best-effort Windows toast notification."""
-    global _winotify_cls, _winotify_checked
+    """Best-effort cross-platform desktop notification."""
+    global _notif_lib, _notif_checked
 
-    # Try winotify (cached check)
-    if not _winotify_checked:
+    # Try winotify on Windows (cached check)
+    if IS_WINDOWS and not _notif_checked:
         try:
             from winotify import Notification
 
-            _winotify_cls = Notification
+            _notif_lib = Notification
         except ImportError:
-            _winotify_cls = None
-        _winotify_checked = True
+            _notif_lib = None
+        _notif_checked = True
 
-    if _winotify_cls is not None:
+    if IS_WINDOWS and _notif_lib is not None:
         try:
-            n = _winotify_cls(app_id="Binger Like Checker", title=title, msg=message)
+            n = _notif_lib(app_id="Binger Like Checker", title=title, msg=message)
             n.show()
             return True
         except Exception:
             pass
 
-    # Fallback: PowerShell native toast (sanitized inputs)
-    try:
-        import subprocess
+    # ── Windows fallback: PowerShell toast ──
+    if IS_WINDOWS:
+        try:
+            safe_title = _sanitize_shell(title)
+            safe_msg = _sanitize_shell(message)
+            ps = (
+                f"[Windows.UI.Notifications.ToastNotificationManager, "
+                f"Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
+                f"$xml = [Windows.UI.Notifications.ToastNotificationManager]"
+                f"::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]"
+                f"::ToastText02); "
+                f'$texts = $xml.GetElementsByTagName("text"); '
+                f'$texts[0].AppendChild($xml.CreateTextNode("{safe_title}")) | Out-Null; '
+                f'$texts[1].AppendChild($xml.CreateTextNode("{safe_msg}")) | Out-Null; '
+                f"$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
+                f"[Windows.UI.Notifications.ToastNotificationManager]"
+                f'::CreateToastNotifier("Binger Like Checker").Show($toast)'
+            )
+            subprocess.Popen(["powershell", "-Command", ps], creationflags=0x08000000)
+            return True
+        except Exception:
+            pass
 
-        safe_title = _sanitize_ps(title)
-        safe_msg = _sanitize_ps(message)
-        ps = (
-            f"[Windows.UI.Notifications.ToastNotificationManager, "
-            f"Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
-            f"$xml = [Windows.UI.Notifications.ToastNotificationManager]"
-            f"::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]"
-            f"::ToastText02); "
-            f'$texts = $xml.GetElementsByTagName("text"); '
-            f'$texts[0].AppendChild($xml.CreateTextNode("{safe_title}")) | Out-Null; '
-            f'$texts[1].AppendChild($xml.CreateTextNode("{safe_msg}")) | Out-Null; '
-            f"$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
-            f"[Windows.UI.Notifications.ToastNotificationManager]"
-            f'::CreateToastNotifier("Binger Like Checker").Show($toast)'
-        )
-        subprocess.Popen(
-            ["powershell", "-Command", ps], creationflags=0x08000000
-        )  # CREATE_NO_WINDOW
-        return True
-    except Exception:
-        pass
+    # ── macOS: osascript notification ──
+    if IS_MAC:
+        try:
+            safe_title = _sanitize_shell(title)
+            safe_msg = _sanitize_shell(message)
+            script = (
+                f'display notification "{safe_msg}" '
+                f'with title "Binger Like Checker" subtitle "{safe_title}"'
+            )
+            subprocess.Popen(["osascript", "-e", script])
+            return True
+        except Exception:
+            pass
+
+    # ── Linux: notify-send ──
+    if IS_LINUX:
+        try:
+            subprocess.Popen(
+                ["notify-send", "Binger Like Checker", f"{title}\n{message}"]
+            )
+            return True
+        except Exception:
+            pass
+
     return False
 
 
@@ -1825,28 +1854,42 @@ class BingerApp:
         if ok:
             self.notif_test_var.set("Test notification sent!")
         else:
-            self.notif_test_var.set(
-                "Could not send notification (install winotify for best results)"
+            hint = (
+                "install winotify"
+                if IS_WINDOWS
+                else "check notification permissions"
+                if IS_MAC
+                else "install notify-send"
             )
+            self.notif_test_var.set(f"Could not send notification ({hint})")
         self._save_cfg()
 
 
 # ═════════════════════════════════════════════════════════════════════
 def main():
-    # Enable DPI awareness for sharp rendering on high-DPI displays
-    try:
-        import ctypes
-
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
-    except Exception:
+    # Enable DPI awareness for sharp rendering on high-DPI displays (Windows only)
+    if IS_WINDOWS:
         try:
             import ctypes
 
-            ctypes.windll.user32.SetProcessDPIAware()
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            try:
+                import ctypes
+
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+    root = tk.Tk()
+
+    # macOS: use native scaling
+    if IS_MAC:
+        try:
+            root.tk.call("tk", "scaling", 2.0)
         except Exception:
             pass
 
-    root = tk.Tk()
     try:
         root.iconbitmap(default="")
     except Exception:

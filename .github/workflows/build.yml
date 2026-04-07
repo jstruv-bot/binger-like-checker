@@ -1,0 +1,98 @@
+name: Build Executables
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+            artifact: BingerLikeChecker-Windows
+            ext: .exe
+          - os: macos-latest
+            name: macOS
+            artifact: BingerLikeChecker-macOS
+            ext: ""
+          - os: ubuntu-latest
+            name: Linux
+            artifact: BingerLikeChecker-Linux
+            ext: ""
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests pyinstaller
+
+      - name: Build executable
+        run: pyinstaller --onefile --windowed --name "BingerLikeChecker" like_checker.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/BingerLikeChecker${{ matrix.ext }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    name: Create Release
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          # Windows
+          cp artifacts/BingerLikeChecker-Windows/BingerLikeChecker.exe release/BingerLikeChecker-Windows.exe
+          # macOS
+          cp artifacts/BingerLikeChecker-macOS/BingerLikeChecker release/BingerLikeChecker-macOS
+          chmod +x release/BingerLikeChecker-macOS
+          # Linux
+          cp artifacts/BingerLikeChecker-Linux/BingerLikeChecker release/BingerLikeChecker-Linux
+          chmod +x release/BingerLikeChecker-Linux
+
+      - name: Delete existing release
+        run: gh release delete latest --yes --cleanup-tag || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
+      - name: Create release
+        run: |
+          gh release create latest \
+            --title "Binger Like Checker - Latest Build" \
+            --notes "Auto-built executables for all platforms.
+
+          **Download for your platform:**
+          - **Windows**: \`BingerLikeChecker-Windows.exe\` - Double-click to run
+          - **macOS**: \`BingerLikeChecker-macOS\` - Download, then run: \`chmod +x BingerLikeChecker-macOS && ./BingerLikeChecker-macOS\`
+          - **Linux**: \`BingerLikeChecker-Linux\` - Download, then run: \`chmod +x BingerLikeChecker-Linux && ./BingerLikeChecker-Linux\`
+
+          Get your GroupMe API token at https://dev.groupme.com" \
+            release/BingerLikeChecker-Windows.exe \
+            release/BingerLikeChecker-macOS \
+            release/BingerLikeChecker-Linux
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}

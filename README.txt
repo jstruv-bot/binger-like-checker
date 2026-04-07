@@ -3,9 +3,10 @@
                      GroupMe Like Analysis Toolkit
 ================================================================================
 
-A Windows desktop application that connects to GroupMe and tells you exactly
-who didn't like a message. Also includes leaderboards, group analytics, like
-history tracking, member exclusions, and notification alerts.
+A cross-platform desktop application (Windows, macOS, Linux) that connects to
+GroupMe and tells you exactly who didn't like a message. Also includes
+leaderboards, group analytics, like history tracking, member exclusions, and
+notification alerts.
 
 
 ================================================================================
@@ -31,15 +32,28 @@ history tracking, member exclusions, and notification alerts.
   1. GETTING STARTED
 ================================================================================
 
-Option A: Run the .exe (recommended)
+Option A: Run the .exe (Windows only, recommended for Windows users)
   - Double-click "BingerLikeChecker.exe" in the dist/ folder.
   - No Python installation required. It's fully self-contained.
 
-Option B: Run the Python script directly
-  - Requires Python 3.10+ installed.
+Option B: Run the Python script directly (Windows, macOS, Linux)
+  - Requires Python 3.10+ with tkinter installed.
   - Open a terminal in the project folder and run:
       pip install -r requirements.txt
       python like_checker.py
+
+macOS NOTES:
+  - Python from python.org or Homebrew includes tkinter. If you get a tkinter
+    error, install it with: brew install python-tk
+  - On first launch, macOS may block the app. Go to System Settings >
+    Privacy & Security and allow it.
+  - For notifications, allow "Script Editor" or "osascript" in System
+    Settings > Notifications.
+
+Linux NOTES:
+  - Make sure tkinter is installed: sudo apt install python3-tk (Debian/Ubuntu)
+    or sudo dnf install python3-tkinter (Fedora).
+  - For notifications, install notify-send: sudo apt install libnotify-bin
 
 
 ================================================================================
@@ -226,8 +240,8 @@ SECTIONS:
   8. TAB 5 - NOTIFICATIONS
 ================================================================================
 
-Get a Windows desktop toast notification when a like check reveals a low like
-rate.
+Get a desktop notification when a like check reveals a low like rate.
+Works on Windows, macOS, and Linux.
 
 SETTINGS:
 
@@ -243,13 +257,25 @@ SETTINGS:
 
 HOW NOTIFICATIONS WORK:
 
-  The app tries two methods, in order:
+  The app uses the native notification system for each platform:
+
+  Windows:
     1. The "winotify" Python library (best experience, install with:
        pip install winotify)
-    2. PowerShell-based Windows toast notifications (built into Windows 10/11,
-       no extra install needed)
+    2. Fallback: PowerShell-based toast notifications (built into Win 10/11)
 
-  If neither method works, the notification log on this tab will say
+  macOS:
+    - Uses osascript (AppleScript) to trigger native Notification Center
+      alerts. No extra install needed.
+    - You may need to allow notifications for "Script Editor" in System
+      Settings > Notifications.
+
+  Linux:
+    - Uses notify-send (libnotify). Install with:
+      sudo apt install libnotify-bin  (Debian/Ubuntu)
+      sudo dnf install libnotify      (Fedora)
+
+  If the notification method fails, the notification log on this tab will say
   "(toast failed)" and the app continues working normally -- it's just the
   desktop popup that won't appear.
 
@@ -310,9 +336,10 @@ FILE LOCATIONS (in your home directory):
                              Contains: timestamps, group/message IDs, like
                              counts, and member names from each check.
 
-On Windows, "~" means C:\Users\YourUsername, so the full paths are:
-  C:\Users\YourUsername\.binger\config.json
-  C:\Users\YourUsername\.binger\history.db
+Full paths by platform:
+  Windows:  C:\Users\YourUsername\.binger\
+  macOS:    /Users/YourUsername/.binger/
+  Linux:    /home/YourUsername/.binger/
 
 TO CLEAR ALL DATA:
   Delete the .binger folder from your home directory. The app will recreate

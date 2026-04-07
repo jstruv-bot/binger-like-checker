@@ -540,6 +540,10 @@ class BingerApp:
         ttk.Label(hdr, textvariable=self.user_label_var, style="Accent.TLabel").pack(
             side=tk.RIGHT
         )
+        self.aot_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            hdr, text="Always on Top", variable=self.aot_var, command=self._toggle_aot
+        ).pack(side=tk.RIGHT, padx=(0, 12))
         ttk.Label(top, text="GroupMe like analysis toolkit", style="Sub.TLabel").pack(
             anchor=tk.W, pady=(0, 6)
         )
@@ -928,6 +932,10 @@ class BingerApp:
         log_frame.pack(fill=tk.BOTH, expand=True)
         self.notif_text = self._make_text(log_frame, height=12)
         self.notif_text.pack(fill=tk.BOTH, expand=True)
+
+    # ──────────────── ALWAYS ON TOP ────────────────
+    def _toggle_aot(self):
+        self.root.attributes("-topmost", self.aot_var.get())
 
     # ──────────────── STATUS / PROGRESS ────────────────
     def _status(self, text):

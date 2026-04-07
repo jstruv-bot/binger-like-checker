@@ -157,42 +157,76 @@ class HistoryDB:
         self._create_tables()
 
     def _create_tables(self):
+        # Check if the existing table has the UNIQUE constraint by looking
+        # for it in the schema. If the old table exists without it, migrate.
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='checks'"
+        ).fetchone()
+
+        if row and "UNIQUE" not in (row[0] or ""):
+            # Old table exists without UNIQUE constraint -- migrate it
+            self.conn.executescript("""
+                -- Deduplicate: keep only the latest check per group+message
+                DELETE FROM checks WHERE id NOT IN (
+                    SELECT MAX(id) FROM checks GROUP BY group_id, message_id
+                );
+
+                -- Rename old table
+                ALTER TABLE checks RENAME TO checks_old;
+
+                -- Create new table with UNIQUE constraint
+                CREATE TABLE checks (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          TEXT NOT NULL,
+                    group_id    TEXT NOT NULL,
+                    group_name  TEXT NOT NULL,
+                    message_id  TEXT NOT NULL,
+                    message_text TEXT,
+                    sender      TEXT,
+                    total_members INTEGER,
+                    liked_count INTEGER,
+                    not_liked_count INTEGER,
+                    like_pct    REAL,
+                    liked_names TEXT,
+                    not_liked_names TEXT,
+                    UNIQUE(group_id, message_id)
+                );
+
+                -- Copy data over
+                INSERT INTO checks SELECT * FROM checks_old;
+
+                -- Drop old table
+                DROP TABLE checks_old;
+            """)
+            self.conn.commit()
+        elif not row:
+            # No table at all -- create fresh
+            self.conn.executescript("""
+                CREATE TABLE checks (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          TEXT NOT NULL,
+                    group_id    TEXT NOT NULL,
+                    group_name  TEXT NOT NULL,
+                    message_id  TEXT NOT NULL,
+                    message_text TEXT,
+                    sender      TEXT,
+                    total_members INTEGER,
+                    liked_count INTEGER,
+                    not_liked_count INTEGER,
+                    like_pct    REAL,
+                    liked_names TEXT,
+                    not_liked_names TEXT,
+                    UNIQUE(group_id, message_id)
+                );
+            """)
+            self.conn.commit()
+
+        # Ensure indexes exist
         self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS checks (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts          TEXT NOT NULL,
-                group_id    TEXT NOT NULL,
-                group_name  TEXT NOT NULL,
-                message_id  TEXT NOT NULL,
-                message_text TEXT,
-                sender      TEXT,
-                total_members INTEGER,
-                liked_count INTEGER,
-                not_liked_count INTEGER,
-                like_pct    REAL,
-                liked_names TEXT,
-                not_liked_names TEXT,
-                UNIQUE(group_id, message_id)
-            );
             CREATE INDEX IF NOT EXISTS idx_checks_group ON checks(group_id);
             CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts);
         """)
         self.conn.commit()
-        # Migrate: deduplicate any existing rows from before the unique constraint
-        self._deduplicate()
-
-    def _deduplicate(self):
-        """One-time migration: remove duplicate rows for the same group+message,
-        keeping only the most recent check per message."""
-        try:
-            self.conn.execute("""
-                DELETE FROM checks WHERE id NOT IN (
-                    SELECT MAX(id) FROM checks GROUP BY group_id, message_id
-                )
-            """)
-            self.conn.commit()
-        except Exception:
-            pass
 
     def close(self):
         try:

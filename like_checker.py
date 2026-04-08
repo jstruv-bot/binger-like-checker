@@ -109,11 +109,27 @@ class GroupMeAPI:
         return self._get(f"/groups/{gid}/messages", p)
 
     def get_pinned_messages(self, gid):
-        """Fetch pinned messages for a group (undocumented endpoint)."""
-        try:
-            return self._get(f"/conversations/{gid}/pinned_messages") or []
-        except Exception:
-            return []
+        """Fetch pinned messages for a group. Tries multiple known endpoints."""
+        # GroupMe has used different endpoint patterns over time
+        endpoints = [
+            f"/groups/{gid}/pinned_messages",
+            f"/conversations/{gid}/pinned_messages",
+            f"/groups/{gid}/pins",
+        ]
+        for ep in endpoints:
+            try:
+                result = self._get(ep)
+                if result:
+                    # Result may be a dict with "pinned_messages" key or a list
+                    if isinstance(result, dict):
+                        msgs = result.get("pinned_messages", result.get("messages", []))
+                        if msgs:
+                            return msgs
+                    elif isinstance(result, list):
+                        return result
+            except Exception:
+                continue
+        return []
 
     def send_message(self, gid, text):
         payload = {"message": {"source_guid": str(uuid.uuid4()), "text": text}}
@@ -1790,6 +1806,18 @@ class BingerApp:
         def work():
             try:
                 pinned = self.api.get_pinned_messages(gid)
+
+                # Fallback: if API returned nothing, scan loaded messages for
+                # messages that have the "pinned_by" or "pinned_at" fields,
+                # or look for system messages about pinning and find the
+                # referenced messages
+                if not pinned and self.messages:
+                    pinned = [
+                        m
+                        for m in self.messages
+                        if m.get("pinned_by") or m.get("pinned_at")
+                    ]
+
                 # Refresh group for fresh members
                 fresh = None
                 try:
@@ -1816,8 +1844,13 @@ class BingerApp:
         if not pinned:
             self._tw(
                 self.results_text,
-                "  No pinned messages found or pinned messages not supported "
-                "for this group.\n",
+                "  No pinned messages found.\n\n"
+                "  This can happen if:\n"
+                "  - The group has no pinned messages\n"
+                "  - The GroupMe pinned messages API is not available\n"
+                "    for this group type\n\n"
+                "  Tip: Try loading messages first, then click Pinned Msgs\n"
+                "  again -- the app will also scan loaded messages for pins.\n",
                 "dim",
             )
             self._status("No pinned messages found.")

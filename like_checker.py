@@ -1991,6 +1991,7 @@ class BingerApp:
         out = []
         W = lambda t, tag=None: out.append((t, tag))
         total_nl = 0
+        all_non_likers = set()
 
         W(f"PINNED MESSAGES CHECK  ({len(pinned)} messages)\n", "header")
         W("=" * 56 + "\n\n", "sep")
@@ -2008,6 +2009,7 @@ class BingerApp:
                 if u not in liked_ids
             ]
             total_nl += len(not_liked)
+            all_non_likers.update(not_liked)
 
             sender = msg.get("name", "Unknown")
             text = (msg.get("text") or "(no text)")[:70]
@@ -2044,6 +2046,15 @@ class BingerApp:
         self._tw_batch(self.results_text, out)
         self.copy_btn.config(state="normal")
         self.export_btn.config(state="normal")
+
+        # Enable shame list with all unique non-likers across pinned messages
+        self._last_not_liked = sorted(all_non_likers, key=str.lower)
+        pin_count = len(pinned)
+        self._last_msg_text = (
+            f"{pin_count} pinned message{'s' if pin_count != 1 else ''}"
+        )
+        self.shame_btn.config(state="normal" if self._last_not_liked else "disabled")
+
         self._status(
             f"Checked {len(pinned)} pinned messages | {total_nl} total non-likers"
         )

@@ -18,7 +18,6 @@ from tkinter import ttk, messagebox, scrolledtext, filedialog
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import platform
 import subprocess
 import sys
 import threading
@@ -164,24 +163,90 @@ class HistoryDB:
         self._create_tables()
 
     def _create_tables(self):
-        # Check if the existing table has the UNIQUE constraint by looking
-        # for it in the schema. If the old table exists without it, migrate.
-        row = self.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='checks'"
-        ).fetchone()
+        try:
+            # Check if the existing table has the UNIQUE constraint by looking
+            # for it in the schema. If the old table exists without it, migrate.
+            row = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='checks'"
+            ).fetchone()
 
-        if row and "UNIQUE" not in (row[0] or ""):
-            # Old table exists without UNIQUE constraint -- migrate it
+            if row and "UNIQUE" not in (row[0] or ""):
+                # Old table exists without UNIQUE constraint -- migrate it
+                self.conn.executescript("""
+                    -- Deduplicate: keep only the latest check per group+message
+                    DELETE FROM checks WHERE id NOT IN (
+                        SELECT MAX(id) FROM checks GROUP BY group_id, message_id
+                    );
+
+                    -- Rename old table
+                    ALTER TABLE checks RENAME TO checks_old;
+
+                    -- Create new table with UNIQUE constraint
+                    CREATE TABLE checks (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts          TEXT NOT NULL,
+                        group_id    TEXT NOT NULL,
+                        group_name  TEXT NOT NULL,
+                        message_id  TEXT NOT NULL,
+                        message_text TEXT,
+                        sender      TEXT,
+                        total_members INTEGER,
+                        liked_count INTEGER,
+                        not_liked_count INTEGER,
+                        like_pct    REAL,
+                        liked_names TEXT,
+                        not_liked_names TEXT,
+                        UNIQUE(group_id, message_id)
+                    );
+
+                    -- Copy data over
+                    INSERT INTO checks SELECT * FROM checks_old;
+
+                    -- Drop old table
+                    DROP TABLE checks_old;
+                """)
+                self.conn.commit()
+            elif not row:
+                # No table at all -- create fresh
+                self.conn.executescript("""
+                    CREATE TABLE checks (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts          TEXT NOT NULL,
+                        group_id    TEXT NOT NULL,
+                        group_name  TEXT NOT NULL,
+                        message_id  TEXT NOT NULL,
+                        message_text TEXT,
+                        sender      TEXT,
+                        total_members INTEGER,
+                        liked_count INTEGER,
+                        not_liked_count INTEGER,
+                        like_pct    REAL,
+                        liked_names TEXT,
+                        not_liked_names TEXT,
+                        UNIQUE(group_id, message_id)
+                    );
+                """)
+                self.conn.commit()
+
+            # Ensure indexes exist
             self.conn.executescript("""
-                -- Deduplicate: keep only the latest check per group+message
-                DELETE FROM checks WHERE id NOT IN (
-                    SELECT MAX(id) FROM checks GROUP BY group_id, message_id
-                );
-
-                -- Rename old table
-                ALTER TABLE checks RENAME TO checks_old;
-
-                -- Create new table with UNIQUE constraint
+                CREATE INDEX IF NOT EXISTS idx_checks_group ON checks(group_id);
+                CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts);
+            """)
+            self.conn.commit()
+        except Exception:
+            # Database is corrupt -- try to delete and recreate
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            try:
+                os.remove(DB_FILE)
+            except Exception:
+                pass
+            self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.executescript("""
                 CREATE TABLE checks (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts          TEXT NOT NULL,
@@ -198,42 +263,10 @@ class HistoryDB:
                     not_liked_names TEXT,
                     UNIQUE(group_id, message_id)
                 );
-
-                -- Copy data over
-                INSERT INTO checks SELECT * FROM checks_old;
-
-                -- Drop old table
-                DROP TABLE checks_old;
+                CREATE INDEX IF NOT EXISTS idx_checks_group ON checks(group_id);
+                CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts);
             """)
             self.conn.commit()
-        elif not row:
-            # No table at all -- create fresh
-            self.conn.executescript("""
-                CREATE TABLE checks (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts          TEXT NOT NULL,
-                    group_id    TEXT NOT NULL,
-                    group_name  TEXT NOT NULL,
-                    message_id  TEXT NOT NULL,
-                    message_text TEXT,
-                    sender      TEXT,
-                    total_members INTEGER,
-                    liked_count INTEGER,
-                    not_liked_count INTEGER,
-                    like_pct    REAL,
-                    liked_names TEXT,
-                    not_liked_names TEXT,
-                    UNIQUE(group_id, message_id)
-                );
-            """)
-            self.conn.commit()
-
-        # Ensure indexes exist
-        self.conn.executescript("""
-            CREATE INDEX IF NOT EXISTS idx_checks_group ON checks(group_id);
-            CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts);
-        """)
-        self.conn.commit()
 
     def close(self):
         try:
@@ -430,7 +463,6 @@ class BingerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Binger Like Checker")
-        self.root.geometry("900x850")
         self.root.minsize(780, 700)
         self.root.configure(bg=C["bg"])
 
@@ -441,14 +473,36 @@ class BingerApp:
         self.selected_group = None
         self.selected_message = None
         self.user_name = None
-        self.excluded_user_ids = set()
+        # Feature 11: per-group exclusions -- dict of group_id -> set(user_ids)
+        self.excluded_ids = {}
         self._msg_cache = {}  # group_id -> (timestamp, messages) for reuse
         self._cache_ttl = 120  # seconds before cache is stale
         self.db = HistoryDB()
+        # Bug 3: initialize _last_not_liked and _last_msg_text
+        self._last_not_liked = None
+        self._last_msg_text = ""
+        # Feature 8: debounce timer id for search filter
+        self._filter_after_id = None
 
         self._apply_theme()
         self._build_ui()
         self._load_saved_config()
+
+        # Feature 13: restore saved window geometry
+        cfg = load_config()
+        saved_geom = cfg.get("geometry", "")
+        if saved_geom:
+            try:
+                self.root.geometry(saved_geom)
+            except Exception:
+                self.root.geometry("900x850")
+        else:
+            self.root.geometry("900x850")
+
+        # Feature 12: keyboard shortcuts
+        self.root.bind("<F5>", self._on_f5)
+        self.root.bind("<Control-Shift-C>", self._on_ctrl_shift_c)
+        self.root.bind("<Control-Shift-c>", self._on_ctrl_shift_c)
 
     # ──────────────── THEME ────────────────
     def _apply_theme(self):
@@ -635,6 +689,7 @@ class BingerApp:
         ttk.Checkbutton(ar, text="Remember", variable=self.save_tok).pack(
             side=tk.LEFT, padx=(0, 8)
         )
+        # Feature 15: connect/disconnect button
         self.connect_btn = ttk.Button(ar, text="Connect", command=self._connect)
         self.connect_btn.pack(side=tk.LEFT)
         ah = ttk.Frame(auth)
@@ -670,6 +725,11 @@ class BingerApp:
             state="disabled",
         )
         self.excl_btn.pack(side=tk.LEFT)
+        # Feature 14: exclusion count indicator
+        self.excl_count_var = tk.StringVar(value="")
+        ttk.Label(gr, textvariable=self.excl_count_var, style="Sub.TLabel").pack(
+            side=tk.LEFT, padx=(4, 0)
+        )
 
         # ── Progress bar ──
         self.progress = ttk.Progressbar(
@@ -780,7 +840,8 @@ class BingerApp:
         self.load_msgs_btn.pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(mt, text="Search:").pack(side=tk.LEFT, padx=(0, 4))
         self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", self._filter_messages)
+        # Feature 8: debounced search filter
+        self.search_var.trace_add("write", self._on_search_changed)
         ttk.Entry(mt, textvariable=self.search_var, width=24).pack(
             side=tk.LEFT, fill=tk.X, expand=True
         )
@@ -810,6 +871,8 @@ class BingerApp:
         self.msg_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.msg_listbox.bind("<<ListboxSelect>>", self._on_message_selected)
+        # Feature 12: bind Return on listbox to check likes
+        self.msg_listbox.bind("<Return>", lambda e: self._check_likes())
 
         # Action row
         ar = ttk.Frame(tab)
@@ -877,6 +940,23 @@ class BingerApp:
             state="disabled",
         )
         self.lb_run_btn.pack(side=tk.LEFT)
+        # Feature 10: Copy and Export buttons on Leaderboard tab
+        self.lb_copy_btn = ttk.Button(
+            cf,
+            text="Copy",
+            style="Small.TButton",
+            command=self._copy_lb,
+            state="disabled",
+        )
+        self.lb_copy_btn.pack(side=tk.LEFT, padx=(8, 4))
+        self.lb_export_btn = ttk.Button(
+            cf,
+            text="Export",
+            style="Small.TButton",
+            command=self._export_lb,
+            state="disabled",
+        )
+        self.lb_export_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.lb_status_var = tk.StringVar()
         ttk.Label(cf, textvariable=self.lb_status_var, style="Sub.TLabel").pack(
             side=tk.RIGHT
@@ -933,6 +1013,23 @@ class BingerApp:
             cf, text="Run Analytics", command=self._run_analytics, state="disabled"
         )
         self.an_run_btn.pack(side=tk.LEFT)
+        # Feature 10: Copy and Export buttons on Analytics tab
+        self.an_copy_btn = ttk.Button(
+            cf,
+            text="Copy",
+            style="Small.TButton",
+            command=self._copy_an,
+            state="disabled",
+        )
+        self.an_copy_btn.pack(side=tk.LEFT, padx=(8, 4))
+        self.an_export_btn = ttk.Button(
+            cf,
+            text="Export",
+            style="Small.TButton",
+            command=self._export_an,
+            state="disabled",
+        )
+        self.an_export_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.an_status_var = tk.StringVar()
         ttk.Label(cf, textvariable=self.an_status_var, style="Sub.TLabel").pack(
             side=tk.RIGHT
@@ -1020,7 +1117,13 @@ class BingerApp:
         if t:
             self.token_var.set(t)
             self.save_tok.set(True)
-        self.excluded_user_ids = set(cfg.get("excluded_user_ids", []))
+        # Feature 11: load per-group exclusions
+        excl_by_group = cfg.get("excluded_by_group", {})
+        if excl_by_group:
+            self.excluded_ids = {gid: set(uids) for gid, uids in excl_by_group.items()}
+        else:
+            # No new key -- start fresh (ignore old "excluded_user_ids")
+            self.excluded_ids = {}
         if cfg.get("notif_enabled"):
             self.notif_enabled_var.set(True)
         if cfg.get("notif_threshold"):
@@ -1030,16 +1133,29 @@ class BingerApp:
         d = {}
         if self.save_tok.get():
             d["token"] = self.token_var.get().strip()
-        d["excluded_user_ids"] = list(self.excluded_user_ids)
+        # Feature 11: save per-group exclusions
+        d["excluded_by_group"] = {
+            gid: list(uids) for gid, uids in self.excluded_ids.items()
+        }
         d["notif_enabled"] = self.notif_enabled_var.get()
         try:
             d["notif_threshold"] = int(self.notif_threshold_var.get())
         except ValueError:
             d["notif_threshold"] = 50
+        # Feature 13: save window geometry
+        try:
+            d["geometry"] = self.root.geometry()
+        except Exception:
+            pass
         save_config(d)
 
-    # ──────────────── CONNECT ────────────────
+    # ──────────────── CONNECT / DISCONNECT ────────────────
     def _connect(self):
+        # Feature 15: if already connected, disconnect instead
+        if self.api is not None:
+            self._disconnect()
+            return
+
         token = self.token_var.get().strip()
         if not token:
             messagebox.showwarning(
@@ -1078,11 +1194,13 @@ class BingerApp:
                 self.root.after(0, lambda: self.connect_btn.config(state="normal"))
                 self.root.after(0, lambda: self._status("Connection failed."))
                 self.root.after(0, self._hide_progress)
+                self.root.after(0, lambda: setattr(self, "api", None))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
                 self.root.after(0, lambda: self.connect_btn.config(state="normal"))
                 self.root.after(0, lambda: self._status("Connection failed."))
                 self.root.after(0, self._hide_progress)
+                self.root.after(0, lambda: setattr(self, "api", None))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1091,13 +1209,58 @@ class BingerApp:
         self._save_cfg()
         self._status(f"Connected as {name}  |  {len(self.groups)} group(s)")
         self.user_label_var.set(f"Connected: {name}")
-        self.connect_btn.config(state="normal")
+        # Feature 15: show Disconnect label
+        self.connect_btn.config(text="Disconnect", state="normal")
         vals = [f"{g['name']}  ({len(g.get('members', []))})" for g in self.groups]
         self.group_combo["values"] = vals
         self.group_combo.config(state="readonly")
         if vals:
             self.group_combo.current(0)
             self._on_group_selected(None)
+
+    # Feature 15: disconnect method
+    def _disconnect(self):
+        self.api = None
+        self.groups = []
+        self.messages = []
+        self._display_messages = []
+        self.selected_group = None
+        self.selected_message = None
+        self.user_name = None
+        self._msg_cache = {}
+        self._last_not_liked = None
+        self._last_msg_text = ""
+
+        # Reset UI
+        self.connect_btn.config(text="Connect", state="normal")
+        self.user_label_var.set("")
+        self.group_combo.set("")
+        self.group_combo["values"] = []
+        self.group_combo.config(state="disabled")
+        self.member_count_var.set("")
+        self.excl_count_var.set("")
+
+        # Disable buttons
+        self.load_msgs_btn.config(state="disabled")
+        self.excl_btn.config(state="disabled")
+        self.check_btn.config(state="disabled")
+        self.copy_btn.config(state="disabled")
+        self.export_btn.config(state="disabled")
+        self.shame_btn.config(state="disabled")
+        self.lb_run_btn.config(state="disabled")
+        self.lb_copy_btn.config(state="disabled")
+        self.lb_export_btn.config(state="disabled")
+        self.an_run_btn.config(state="disabled")
+        self.an_copy_btn.config(state="disabled")
+        self.an_export_btn.config(state="disabled")
+        self.hist_refresh_btn.config(state="disabled")
+        self.hist_offenders_btn.config(state="disabled")
+
+        # Clear listbox
+        self.msg_listbox.delete(0, tk.END)
+        self.msg_count_var.set("")
+
+        self._status("Disconnected.")
 
     # ──────────────── GROUP SELECTION ────────────────
     def _on_group_selected(self, event):
@@ -1121,6 +1284,22 @@ class BingerApp:
         self.copy_btn.config(state="disabled")
         self.export_btn.config(state="disabled")
         self.shame_btn.config(state="disabled")
+        # Feature 14: update exclusion count indicator on group switch
+        self._update_excl_count()
+        # Bug 2: refresh group data in background when group is selected
+        self._refresh_group_data()
+
+    # Feature 14: update exclusion count label
+    def _update_excl_count(self):
+        if self.selected_group:
+            gid = self.selected_group["id"]
+            n = len(self.excluded_ids.get(gid, set()))
+            if n > 0:
+                self.excl_count_var.set(f"({n} excluded)")
+            else:
+                self.excl_count_var.set("")
+        else:
+            self.excl_count_var.set("")
 
     # ──────────────── EXCLUSIONS DIALOG ────────────────
     def _open_exclusions(self):
@@ -1130,6 +1309,9 @@ class BingerApp:
         if not members:
             messagebox.showinfo("No Members", "This group has no members.")
             return
+
+        gid = self.selected_group["id"]
+        current_excluded = self.excluded_ids.get(gid, set())
 
         dlg = tk.Toplevel(self.root)
         dlg.title("Member Exclusions")
@@ -1168,7 +1350,7 @@ class BingerApp:
         for m in sorted(members, key=lambda x: x.get("nickname", "").lower()):
             uid = m.get("user_id", "")
             nick = m.get("nickname", "Unknown")
-            var = tk.BooleanVar(value=(uid in self.excluded_user_ids))
+            var = tk.BooleanVar(value=(uid in current_excluded))
             check_vars[uid] = var
             cb = ttk.Checkbutton(inner, text=nick, variable=var)
             cb.pack(anchor=tk.W, pady=1)
@@ -1186,10 +1368,12 @@ class BingerApp:
                 v.set(False)
 
         def apply_excl():
-            self.excluded_user_ids = {uid for uid, v in check_vars.items() if v.get()}
+            self.excluded_ids[gid] = {uid for uid, v in check_vars.items() if v.get()}
             self._save_cfg()
-            n = len(self.excluded_user_ids)
+            n = len(self.excluded_ids[gid])
             self._status(f"Exclusions updated: {n} member(s) excluded")
+            # Feature 14: update count indicator
+            self._update_excl_count()
             dlg.destroy()
 
         ttk.Button(
@@ -1198,7 +1382,6 @@ class BingerApp:
         ttk.Button(
             btn_frame, text="None", style="Small.TButton", command=select_none
         ).pack(side=tk.LEFT, padx=(0, 4))
-        excl_count = len([1 for v in check_vars.values() if v.get()])
         ttk.Button(btn_frame, text="Apply", command=apply_excl).pack(side=tk.RIGHT)
 
     # ──────────────── MESSAGE CACHE ────────────────
@@ -1212,6 +1395,33 @@ class BingerApp:
         msgs = fetch_messages_bulk(self.api, gid, count, progress_cb)
         self._msg_cache[gid] = (time.time(), msgs)
         return msgs
+
+    # ──────────────── REFRESH GROUP DATA (background) ────────────────
+    # Bug 2: separate method to refresh group data in background
+    def _refresh_group_data(self):
+        """Fetch fresh group data in background and update cached selected_group."""
+        if not self.api or not self.selected_group:
+            return
+        gid = self.selected_group["id"]
+        idx = self.group_combo.current()
+
+        def work():
+            try:
+                fg = self.api.get_group(gid)
+                if fg and fg.get("members"):
+                    self.root.after(0, lambda: self._apply_refreshed_group(fg, idx))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_refreshed_group(self, fg, idx):
+        """Apply refreshed group data on the main thread."""
+        self.selected_group = fg
+        if idx >= 0 and idx < len(self.groups):
+            self.groups[idx] = fg
+        mc = len(fg.get("members", []))
+        self.member_count_var.set(f"{mc} members")
 
     # ──────────────── LOAD MESSAGES ────────────────
     def _load_messages(self):
@@ -1234,7 +1444,10 @@ class BingerApp:
                         0, lambda: self._status(f"Loading messages... ({n})")
                     )
 
-                self.messages = fetch_messages_bulk(self.api, gid, limit, pcb)
+                msgs = fetch_messages_bulk(self.api, gid, limit, pcb)
+                self.messages = msgs
+                # Bug 5: populate message cache after fetching
+                self._msg_cache[gid] = (time.time(), msgs)
                 self.root.after(0, self._populate_messages)
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -1255,16 +1468,32 @@ class BingerApp:
         self._status(f"Loaded {len(self.messages)} messages")
 
     @staticmethod
+    def _truncate_name(name, width=14):
+        """Truncate name with ellipsis if too long, pad to width.
+        Optimization 9: show '..'' when truncated."""
+        if len(name) <= width:
+            return name.ljust(width)
+        return name[: width - 2] + ".."
+
+    @staticmethod
     def _format_msg_row(msg):
         """Format a message dict into a listbox display string."""
         ts = datetime.fromtimestamp(msg.get("created_at", 0)).strftime("%m/%d %H:%M")
-        name = msg.get("name", "???")[:14].ljust(14)
+        name = BingerApp._truncate_name(msg.get("name", "???"), 14)
         text = (msg.get("text") or "(attachment)")[:50].replace("\n", " ")
         likes = len(msg.get("favorited_by", []))
         h = "+" if likes > 0 else " "
         return f" [{ts}] {name} {h}{str(likes).rjust(2)}L  {text}"
 
+    # Feature 8: debounced search filter
+    def _on_search_changed(self, *args):
+        """Called on every keystroke -- schedules a debounced filter."""
+        if self._filter_after_id is not None:
+            self.root.after_cancel(self._filter_after_id)
+        self._filter_after_id = self.root.after(150, self._filter_messages)
+
     def _filter_messages(self, *args):
+        self._filter_after_id = None
         q = self.search_var.get().strip().lower()
         self.msg_listbox.delete(0, tk.END)
         self._display_messages = []
@@ -1290,19 +1519,9 @@ class BingerApp:
 
     # ──────────────── LIKE CHECKER ────────────────
     def _get_member_map(self, group):
-        """Build user_id->nickname map, refreshing group data."""
+        """Build user_id->nickname map from cached group data (no network call).
+        Bug 2 fix: uses cached self.selected_group['members'] instead of API call."""
         members = group.get("members", [])
-        if self.api:
-            try:
-                fg = self.api.get_group(group["id"])
-                if fg and fg.get("members"):
-                    members = fg["members"]
-                    self.selected_group = fg
-                    idx = self.group_combo.current()
-                    if idx >= 0:
-                        self.groups[idx] = fg
-            except Exception:
-                pass
         mm = {}
         for m in members:
             uid = m.get("user_id")
@@ -1314,29 +1533,110 @@ class BingerApp:
         if not self.selected_group or not self.selected_message:
             return
         self._tc(self.results_text)
+        self._status("Checking likes...")
         msg = self.selected_message
-        mm = self._get_member_map(self.selected_group)
-        liked_ids = set(msg.get("favorited_by", []))
+        group = self.selected_group
+        gid = group["id"]
 
-        # Apply exclusions
-        active_ids = {uid for uid in mm if uid not in self.excluded_user_ids}
-        excluded_names = sorted(
-            [mm[uid] for uid in mm if uid in self.excluded_user_ids], key=str.lower
-        )
+        # Bug 1: run network call + processing in a background thread
+        def work():
+            try:
+                # Refresh group data in background for fresh member list
+                fresh_group = None
+                if self.api:
+                    try:
+                        fresh_group = self.api.get_group(gid)
+                    except Exception:
+                        pass
 
-        liked, not_liked = [], []
-        for uid in sorted(active_ids, key=lambda u: mm[u].lower()):
-            (liked if uid in liked_ids else not_liked).append(mm[uid])
+                # Build member map from fresh or cached data
+                src_group = (
+                    fresh_group
+                    if (fresh_group and fresh_group.get("members"))
+                    else group
+                )
+                members = src_group.get("members", [])
+                mm = {}
+                for m in members:
+                    uid = m.get("user_id")
+                    if uid:
+                        mm[uid] = m.get("nickname", "Unknown")
 
-        sender = msg.get("name", "Unknown")
-        text = msg.get("text") or "(no text)"
-        ts = datetime.fromtimestamp(msg.get("created_at", 0)).strftime(
-            "%Y-%m-%d  %H:%M:%S"
-        )
-        total = len(active_ids)
-        nl = len(not_liked)
-        lk = len(liked)
-        pct = (lk / total * 100) if total > 0 else 0
+                liked_ids = set(msg.get("favorited_by", []))
+
+                # Feature 11: per-group exclusions
+                excluded_set = self.excluded_ids.get(gid, set())
+
+                # Apply exclusions
+                active_ids = {uid for uid in mm if uid not in excluded_set}
+                excluded_names = sorted(
+                    [mm[uid] for uid in mm if uid in excluded_set], key=str.lower
+                )
+
+                liked, not_liked = [], []
+                for uid in sorted(active_ids, key=lambda u: mm[u].lower()):
+                    (liked if uid in liked_ids else not_liked).append(mm[uid])
+
+                sender = msg.get("name", "Unknown")
+                text = msg.get("text") or "(no text)"
+                ts = datetime.fromtimestamp(msg.get("created_at", 0)).strftime(
+                    "%Y-%m-%d  %H:%M:%S"
+                )
+                total = len(active_ids)
+                nl = len(not_liked)
+                lk = len(liked)
+                pct = (lk / total * 100) if total > 0 else 0
+
+                # Render on main thread
+                self.root.after(
+                    0,
+                    lambda: self._render_check_results(
+                        src_group,
+                        fresh_group,
+                        msg,
+                        mm,
+                        liked,
+                        not_liked,
+                        excluded_names,
+                        sender,
+                        text,
+                        ts,
+                        total,
+                        nl,
+                        lk,
+                        pct,
+                    ),
+                )
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                self.root.after(0, lambda: self._status("Check failed."))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_check_results(
+        self,
+        src_group,
+        fresh_group,
+        msg,
+        mm,
+        liked,
+        not_liked,
+        excluded_names,
+        sender,
+        text,
+        ts,
+        total,
+        nl,
+        lk,
+        pct,
+    ):
+        """Render like check results on the main thread."""
+        # Update cached group data if we got fresh data
+        if fresh_group and fresh_group.get("members"):
+            self.selected_group = fresh_group
+            idx = self.group_combo.current()
+            if idx >= 0 and idx < len(self.groups):
+                self.groups[idx] = fresh_group
 
         out = []
         W = lambda t, tag=None: out.append((t, tag))
@@ -1451,6 +1751,60 @@ class BingerApp:
             except Exception as e:
                 messagebox.showerror("Error", str(e))
 
+    # Feature 10: Leaderboard copy/export
+    def _copy_lb(self):
+        t = self.lb_text.get("1.0", tk.END).strip()
+        if t:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(t)
+            self._status("Leaderboard copied to clipboard!")
+
+    def _export_lb(self):
+        t = self.lb_text.get("1.0", tk.END).strip()
+        if not t:
+            return
+        gn = (self.selected_group or {}).get("name", "group")
+        safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in gn)
+        fp = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            initialfile=f"binger_lb_{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            filetypes=[("Text", "*.txt"), ("All", "*.*")],
+        )
+        if fp:
+            try:
+                with open(fp, "w", encoding="utf-8") as f:
+                    f.write(t)
+                self._status(f"Leaderboard exported to {fp}")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    # Feature 10: Analytics copy/export
+    def _copy_an(self):
+        t = self.an_text.get("1.0", tk.END).strip()
+        if t:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(t)
+            self._status("Analytics copied to clipboard!")
+
+    def _export_an(self):
+        t = self.an_text.get("1.0", tk.END).strip()
+        if not t:
+            return
+        gn = (self.selected_group or {}).get("name", "group")
+        safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in gn)
+        fp = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            initialfile=f"binger_an_{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            filetypes=[("Text", "*.txt"), ("All", "*.*")],
+        )
+        if fp:
+            try:
+                with open(fp, "w", encoding="utf-8") as f:
+                    f.write(t)
+                self._status(f"Analytics exported to {fp}")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
     def _build_shame_text(self, template, not_liked, msg_preview):
         """Build the final shame message from a template string.
         Placeholders:
@@ -1477,13 +1831,13 @@ class BingerApp:
         )
 
     def _send_shame_message(self):
-        if not getattr(self, "_last_not_liked", None) or not self.selected_group:
+        if not self._last_not_liked or not self.selected_group:
             return
         if not self.api:
             return
 
         not_liked = self._last_not_liked
-        msg_preview = getattr(self, "_last_msg_text", "a message")[:50]
+        msg_preview = (self._last_msg_text or "a message")[:50]
 
         # Load saved template or use default
         cfg = load_config()
@@ -1641,10 +1995,22 @@ class BingerApp:
         self._hide_progress()
         self.lb_run_btn.config(state="normal")
         self._tc(self.lb_text)
+
+        # Feature 16: empty guard for leaderboard
+        if not msgs:
+            self._tw(self.lb_text, "  No messages to analyze.\n", "dim")
+            self.lb_status_var.set("")
+            return
+
         out = []  # collect (text, tag) for batch write
         W = lambda t, tag=None: out.append((t, tag))
 
+        # Bug 2: use cached group data instead of network call
         mm = self._get_member_map(self.selected_group)
+
+        # Feature 11: per-group exclusions for leaderboard stingiest section
+        gid = self.selected_group["id"] if self.selected_group else ""
+        excluded_set = self.excluded_ids.get(gid, set())
 
         # Likes given (who likes other people's messages)
         given = Counter()
@@ -1698,7 +2064,7 @@ class BingerApp:
         W("LEAST LIKES GIVEN (stingiest members)\n", "header")
         W("-" * 56 + "\n", "sep")
         all_members_given = [
-            (uid, given.get(uid, 0)) for uid in mm if uid not in self.excluded_user_ids
+            (uid, given.get(uid, 0)) for uid in mm if uid not in excluded_set
         ]
         all_members_given.sort(key=lambda x: x[1])
         for i, (uid, cnt) in enumerate(all_members_given[:15]):
@@ -1715,6 +2081,9 @@ class BingerApp:
             W(f"  {prefix.rjust(3)}  {mm[uid]:<20} {cnt:>5} messages\n", tag)
 
         self._tw_batch(self.lb_text, out)
+        # Feature 10: enable copy/export after rendering
+        self.lb_copy_btn.config(state="normal")
+        self.lb_export_btn.config(state="normal")
 
     # ════════════════════════════════════════════════════════
     #  HISTORY
@@ -1834,6 +2203,7 @@ class BingerApp:
         out = []  # collect (text, tag) for batch write
         W = lambda t, tag=None: out.append((t, tag))
 
+        # Bug 2: use cached group data instead of network call
         mm = self._get_member_map(self.selected_group)
         total = len(msgs)
         if total == 0:
@@ -1968,6 +2338,9 @@ class BingerApp:
             )
 
         self._tw_batch(self.an_text, out)
+        # Feature 10: enable copy/export after rendering
+        self.an_copy_btn.config(state="normal")
+        self.an_export_btn.config(state="normal")
 
     # ════════════════════════════════════════════════════════
     #  NOTIFICATIONS
@@ -1986,6 +2359,24 @@ class BingerApp:
             )
             self.notif_test_var.set(f"Could not send notification ({hint})")
         self._save_cfg()
+
+    # ════════════════════════════════════════════════════════
+    #  KEYBOARD SHORTCUTS (Feature 12)
+    # ════════════════════════════════════════════════════════
+    def _on_f5(self, event=None):
+        """F5: reload messages if a group is selected."""
+        if self.selected_group and self.api:
+            self._load_messages()
+
+    def _on_ctrl_shift_c(self, event=None):
+        """Ctrl+Shift+C: copy current tab's results."""
+        current_tab = self.notebook.index(self.notebook.select())
+        if current_tab == 0:
+            self._copy_results()
+        elif current_tab == 1:
+            self._copy_lb()
+        elif current_tab == 3:
+            self._copy_an()
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -2019,8 +2410,10 @@ def main():
         pass
     app = BingerApp(root)
 
-    # Graceful shutdown: close DB on exit
+    # Graceful shutdown: close DB and save geometry on exit
     def on_close():
+        # Feature 13: save geometry before closing
+        app._save_cfg()
         app.db.close()
         root.destroy()
 

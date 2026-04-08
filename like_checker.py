@@ -1173,6 +1173,9 @@ class BingerApp:
             self.notif_enabled_var.set(True)
         if cfg.get("notif_threshold"):
             self.notif_threshold_var.set(str(cfg["notif_threshold"]))
+        # Auto-connect if a saved token exists
+        if t:
+            self.root.after(100, self._connect)
 
     def _save_cfg(self):
         d = {}

@@ -504,6 +504,9 @@ class BingerApp:
         self.user_name = None
         # Feature 11: per-group exclusions -- dict of group_id -> set(user_ids)
         self.excluded_ids = {}
+        # Sir posters: only messages from these people are checked for likes
+        # dict of group_id -> set(user_ids). Empty set = check all posters.
+        self.sir_ids = {}
         self._msg_cache = {}  # group_id -> (timestamp, messages) for reuse
         self._cache_ttl = 120  # seconds before cache is stale
         self.db = HistoryDB()
@@ -757,6 +760,18 @@ class BingerApp:
         # Feature 14: exclusion count indicator
         self.excl_count_var = tk.StringVar(value="")
         ttk.Label(gr, textvariable=self.excl_count_var, style="Sub.TLabel").pack(
+            side=tk.LEFT, padx=(4, 0)
+        )
+        self.sir_btn = ttk.Button(
+            gr,
+            text="Sirs",
+            style="Small.TButton",
+            command=self._open_sir_picker,
+            state="disabled",
+        )
+        self.sir_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.sir_count_var = tk.StringVar(value="")
+        ttk.Label(gr, textvariable=self.sir_count_var, style="Sub.TLabel").pack(
             side=tk.LEFT, padx=(4, 0)
         )
 
@@ -1169,6 +1184,12 @@ class BingerApp:
         else:
             # No new key -- start fresh (ignore old "excluded_user_ids")
             self.excluded_ids = {}
+        # Load Sir posters per group
+        sir_by_group = cfg.get("sir_by_group", {})
+        if sir_by_group:
+            self.sir_ids = {gid: set(uids) for gid, uids in sir_by_group.items()}
+        else:
+            self.sir_ids = {}
         if cfg.get("notif_enabled"):
             self.notif_enabled_var.set(True)
         if cfg.get("notif_threshold"):
@@ -1185,6 +1206,8 @@ class BingerApp:
         d["excluded_by_group"] = {
             gid: list(uids) for gid, uids in self.excluded_ids.items()
         }
+        # Save Sir posters per group
+        d["sir_by_group"] = {gid: list(uids) for gid, uids in self.sir_ids.items()}
         d["notif_enabled"] = self.notif_enabled_var.get()
         try:
             d["notif_threshold"] = int(self.notif_threshold_var.get())
@@ -1291,6 +1314,7 @@ class BingerApp:
         # Disable buttons
         self.load_msgs_btn.config(state="disabled")
         self.excl_btn.config(state="disabled")
+        self.sir_btn.config(state="disabled")
         self.pinned_btn.config(state="disabled")
         self.check_btn.config(state="disabled")
         self.copy_btn.config(state="disabled")
@@ -1324,6 +1348,8 @@ class BingerApp:
         self.load_msgs_btn.config(state="normal")
         self.excl_btn.config(state="normal")
         self.pinned_btn.config(state="normal")
+        self.sir_btn.config(state="normal")
+        self._update_sir_count()
         self.lb_run_btn.config(state="normal")
         self.lb_report_btn.config(state="normal")
         self.an_run_btn.config(state="normal")
@@ -1354,6 +1380,99 @@ class BingerApp:
             self.excl_count_var.set("")
 
     # ──────────────── EXCLUSIONS DIALOG ────────────────
+    # ──────────────── SIR POSTERS ────────────────
+    def _get_sir_ids(self):
+        """Get Sir user IDs for the current group. Empty = all posters."""
+        if not self.selected_group:
+            return set()
+        return self.sir_ids.get(self.selected_group["id"], set())
+
+    def _update_sir_count(self):
+        sirs = self._get_sir_ids()
+        if sirs and self.selected_group:
+            mm = self._get_member_map(self.selected_group)
+            names = [mm.get(uid, "?") for uid in sirs if uid in mm]
+            self.sir_count_var.set(
+                f"({len(names)} Sir{'s' if len(names) != 1 else ''})"
+            )
+        else:
+            self.sir_count_var.set("")
+
+    def _open_sir_picker(self):
+        if not self.selected_group:
+            return
+        members = self.selected_group.get("members", [])
+        if not members:
+            messagebox.showinfo("No Members", "This group has no members.")
+            return
+
+        gid = self.selected_group["id"]
+        current_sirs = self.sir_ids.get(gid, set())
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Select Sirs")
+        dlg.geometry("400x520")
+        dlg.configure(bg=C["bg"])
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Select Sirs", style="Header.TLabel").pack(
+            pady=(12, 2), padx=16
+        )
+        ttk.Label(
+            dlg,
+            text="Only messages from selected Sirs will be checked for likes.\n"
+            "Leave all unchecked to check messages from everyone.",
+            style="Sub.TLabel",
+        ).pack(padx=16, pady=(0, 8))
+
+        canvas_frame = ttk.Frame(dlg)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        canvas = tk.Canvas(canvas_frame, bg=C["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(
+            canvas_frame, orient=tk.VERTICAL, command=canvas.yview
+        )
+        inner = ttk.Frame(canvas)
+        inner.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        check_vars = {}
+        for m in sorted(members, key=lambda x: x.get("nickname", "").lower()):
+            uid = m.get("user_id", "")
+            nick = m.get("nickname", "Unknown")
+            var = tk.BooleanVar(value=(uid in current_sirs))
+            check_vars[uid] = var
+            ttk.Checkbutton(inner, text=nick, variable=var).pack(anchor=tk.W, pady=1)
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill=tk.X, padx=16, pady=(0, 12))
+
+        def select_none():
+            for v in check_vars.values():
+                v.set(False)
+
+        def apply_sirs():
+            selected = {uid for uid, v in check_vars.items() if v.get()}
+            self.sir_ids[gid] = selected
+            self._save_cfg()
+            self._update_sir_count()
+            n = len(selected)
+            if n:
+                self._status(f"Sirs updated: {n} member(s) selected")
+            else:
+                self._status("Sirs cleared: checking messages from everyone")
+            dlg.destroy()
+
+        ttk.Button(
+            btn_frame, text="Clear All", style="Small.TButton", command=select_none
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(btn_frame, text="Apply", command=apply_sirs).pack(side=tk.RIGHT)
+
     def _open_exclusions(self):
         if not self.selected_group:
             return
@@ -1513,7 +1632,8 @@ class BingerApp:
         self.msg_listbox.delete(0, tk.END)
         self._display_messages = list(self.messages)
         # Batch insert all rows at once to avoid per-item overhead
-        rows = [self._format_msg_row(m) for m in self._display_messages]
+        sirs = self._get_sir_ids()
+        rows = [self._format_msg_row(m, sirs) for m in self._display_messages]
         self.msg_listbox.insert(tk.END, *rows)
         self.load_msgs_btn.config(state="normal")
         self.msg_count_var.set(f"{len(self.messages)} msgs")
@@ -1547,7 +1667,7 @@ class BingerApp:
         return "".join(parts)
 
     @staticmethod
-    def _format_msg_row(msg):
+    def _format_msg_row(msg, sir_ids=None):
         """Format a message dict into a listbox display string."""
         ts = datetime.fromtimestamp(msg.get("created_at", 0)).strftime("%m/%d %H:%M")
         name = BingerApp._truncate_name(msg.get("name", "???"), 14)
@@ -1562,7 +1682,9 @@ class BingerApp:
         text = text[:50].replace("\n", " ")
         likes = len(msg.get("favorited_by", []))
         h = "+" if likes > 0 else " "
-        return f" [{ts}] {name} {h}{str(likes).rjust(2)}L  {text}"
+        # Mark Sir messages with * prefix
+        sir_mark = "*" if sir_ids and msg.get("user_id") in sir_ids else " "
+        return f"{sir_mark}[{ts}] {name} {h}{str(likes).rjust(2)}L  {text}"
 
     # Feature 8: debounced search filter
     def _on_search_changed(self, *args):
@@ -1577,12 +1699,13 @@ class BingerApp:
         self.msg_listbox.delete(0, tk.END)
         self._display_messages = []
         rows = []
+        sirs = self._get_sir_ids()
         for m in self.messages:
             t = (m.get("text") or "").lower()
             n = (m.get("name") or "").lower()
             if q in t or q in n:
                 self._display_messages.append(m)
-                rows.append(self._format_msg_row(m))
+                rows.append(self._format_msg_row(m, sirs))
         if rows:
             self.msg_listbox.insert(tk.END, *rows)
 
@@ -1611,6 +1734,17 @@ class BingerApp:
     def _check_likes(self):
         if not self.selected_group or not self.selected_message:
             return
+        # Warn if Sirs are set and this message isn't from a Sir
+        sirs = self._get_sir_ids()
+        if sirs:
+            sender_id = self.selected_message.get("user_id", "")
+            if sender_id not in sirs:
+                sender_name = self.selected_message.get("name", "Unknown")
+                if not messagebox.askyesno(
+                    "Not a Sir",
+                    f'"{sender_name}" is not a Sir.\n\nCheck this message anyway?',
+                ):
+                    return
         self._tc(self.results_text)
         self._status("Checking likes...")
         msg = self.selected_message
@@ -2362,15 +2496,33 @@ class BingerApp:
         # Messages sent
         sent_count = Counter()
 
+        # Sir poster IDs for this group
+        sir_set = self._get_sir_ids()
+
+        # Track Sir message non-likes
+        sir_msg_count = 0
+        sir_non_likes = Counter()  # uid -> times they didn't like a Sir msg
+
         for m in msgs:
             sender_id = m.get("user_id", "")
             if sender_id in mm:
                 sent_count[sender_id] += 1
-            for uid in m.get("favorited_by", []):
+            fav_by = set(m.get("favorited_by", []))
+            for uid in fav_by:
                 if uid in mm:
                     given[uid] += 1
                 if sender_id in mm:
                     received[sender_id] += 1
+            # Count Sir message non-likes
+            if sir_set and sender_id in sir_set:
+                sir_msg_count += 1
+                for uid in mm:
+                    if (
+                        uid not in excluded_set
+                        and uid != sender_id
+                        and uid not in fav_by
+                    ):
+                        sir_non_likes[uid] += 1
 
         total_msgs = len(msgs)
         self.lb_status_var.set(f"Analyzed {total_msgs} messages")
@@ -2379,6 +2531,29 @@ class BingerApp:
 
         W(f"LEADERBOARD  ({total_msgs} messages scanned)\n", "header")
         W("=" * 56 + "\n\n", "sep")
+
+        # ── Sir Message Non-Likers (PRIMARY METRIC) ──
+        if sir_set:
+            sir_names = [mm.get(uid, "?") for uid in sir_set if uid in mm]
+            W(
+                f"SIR MESSAGE NON-LIKERS  ({sir_msg_count} msgs from: "
+                f"{', '.join(sir_names)})\n",
+                "header",
+            )
+            W("-" * 56 + "\n", "sep")
+            if sir_non_likes:
+                ranked = sir_non_likes.most_common(20)
+                for i, (uid, cnt) in enumerate(ranked):
+                    tag = "not_liked" if i < 3 else "dim"
+                    pct = (cnt / sir_msg_count * 100) if sir_msg_count else 0
+                    W(
+                        f"  {i + 1:>3}  {mm[uid]:<20} {cnt:>4} missed  "
+                        f"({pct:.0f}% of Sir msgs)\n",
+                        tag,
+                    )
+            else:
+                W("  Everyone liked all Sir messages!\n", "liked")
+            W("\n")
 
         # ── Likes Given ──
         W("MOST LIKES GIVEN (generous likers)\n", "header")
@@ -2539,14 +2714,18 @@ class BingerApp:
         likes_received = 0
         most_liked_msg = None
         most_liked_count = -1
-        # Who this member likes most
         likes_to = Counter()
-        # Who likes this member most
         likes_from = Counter()
+
+        # Sir tracking
+        sir_set = self._get_sir_ids()
+        sir_msg_total = 0
+        sir_msgs_not_liked = 0
 
         for m in msgs:
             sender_id = m.get("user_id", "")
             fav_by = m.get("favorited_by", [])
+            fav_set = set(fav_by)
 
             # Messages sent by this member
             if sender_id == uid:
@@ -2556,16 +2735,21 @@ class BingerApp:
                 if lk > most_liked_count:
                     most_liked_count = lk
                     most_liked_msg = m
-                # Who likes this member's messages
                 for liker_id in fav_by:
                     if liker_id in mm and liker_id != uid:
                         likes_from[liker_id] += 1
 
             # Likes given by this member
-            if uid in fav_by:
+            if uid in fav_set:
                 likes_given += 1
                 if sender_id in mm and sender_id != uid:
                     likes_to[sender_id] += 1
+
+            # Sir message tracking: did this member like Sir messages?
+            if sir_set and sender_id in sir_set and sender_id != uid:
+                sir_msg_total += 1
+                if uid not in fav_set:
+                    sir_msgs_not_liked += 1
 
         avg_likes = likes_received / sent if sent > 0 else 0
         like_rate = (likes_given / total_msgs * 100) if total_msgs > 0 else 0
@@ -2576,6 +2760,29 @@ class BingerApp:
 
         W(f"MEMBER REPORT CARD: {nick}\n", "header")
         W("=" * 56 + "\n\n", "sep")
+
+        # Sir message stats (primary metric, shown first)
+        if sir_set:
+            sir_liked = sir_msg_total - sir_msgs_not_liked
+            sir_pct = (sir_msgs_not_liked / sir_msg_total * 100) if sir_msg_total else 0
+            sir_names = [mm.get(s, "?") for s in sir_set if s in mm]
+            W("SIR MESSAGES\n", "header")
+            W("-" * 56 + "\n", "sep")
+            W(f"  Sirs: {', '.join(sir_names)}\n", "dim")
+            W(f"  Sir Messages:       {sir_msg_total}\n", "info")
+            W(f"  Liked:              {sir_liked}\n", "liked")
+            W(f"  ", "info")
+            W(
+                f"Did NOT Like:       {sir_msgs_not_liked}  ({sir_pct:.0f}%)\n",
+                "not_liked" if sir_msgs_not_liked > 0 else "liked",
+            )
+            bw2 = 30
+            missed_fill = round(sir_pct / 100 * bw2)
+            W(
+                f"  Miss Rate:  [{('X' * missed_fill) + ('-' * (bw2 - missed_fill))}]\n",
+                "not_liked" if sir_pct > 30 else "stat",
+            )
+            W("\n")
 
         W("OVERVIEW\n", "header")
         W("-" * 56 + "\n", "sep")

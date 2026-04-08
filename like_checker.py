@@ -108,9 +108,16 @@ class GroupMeAPI:
             p["before_id"] = before_id
         return self._get(f"/groups/{gid}/messages", p)
 
+    def _get_fast(self, endpoint, timeout=3):
+        """Like _get but with a short timeout for speculative requests."""
+        params = {"token": self.token}
+        r = self.session.get(f"{API_BASE}{endpoint}", params=params, timeout=timeout)
+        r.raise_for_status()
+        return r.json().get("response")
+
     def get_pinned_messages(self, gid):
-        """Fetch pinned messages for a group. Tries multiple known endpoints."""
-        # GroupMe has used different endpoint patterns over time
+        """Fetch pinned messages for a group. Tries multiple known endpoints
+        with short timeouts since these are undocumented and often fail."""
         endpoints = [
             f"/groups/{gid}/pinned_messages",
             f"/conversations/{gid}/pinned_messages",
@@ -118,9 +125,8 @@ class GroupMeAPI:
         ]
         for ep in endpoints:
             try:
-                result = self._get(ep)
+                result = self._get_fast(ep, timeout=3)
                 if result:
-                    # Result may be a dict with "pinned_messages" key or a list
                     if isinstance(result, dict):
                         msgs = result.get("pinned_messages", result.get("messages", []))
                         if msgs:
@@ -1805,18 +1811,19 @@ class BingerApp:
 
         def work():
             try:
-                pinned = self.api.get_pinned_messages(gid)
+                pinned = []
 
-                # Fallback: if API returned nothing, scan loaded messages for
-                # messages that have the "pinned_by" or "pinned_at" fields,
-                # or look for system messages about pinning and find the
-                # referenced messages
-                if not pinned and self.messages:
+                # Fast path: scan already-loaded messages first (instant)
+                if self.messages:
                     pinned = [
                         m
                         for m in self.messages
                         if m.get("pinned_by") or m.get("pinned_at")
                     ]
+
+                # Slow path: only hit API if no messages loaded or scan found nothing
+                if not pinned:
+                    pinned = self.api.get_pinned_messages(gid)
 
                 # Refresh group for fresh members
                 fresh = None

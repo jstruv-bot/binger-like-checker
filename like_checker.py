@@ -1804,15 +1804,12 @@ class BingerApp:
     def _check_pinned(self):
         if not self.selected_group or not self.api:
             return
-        self._tc(self.results_text)
-        self._status("Fetching pinned messages...")
+        self._status("Scanning for pinned messages...")
         self._show_progress()
         gid = self.selected_group["id"]
 
         def work():
             try:
-                pinned = []
-
                 # If no messages loaded yet, fetch them automatically
                 msgs = self.messages
                 if not msgs:
@@ -1837,12 +1834,129 @@ class BingerApp:
                     fresh = self.api.get_group(gid)
                 except Exception:
                     pass
-                self.root.after(0, lambda: self._render_pinned(pinned, fresh))
+                self.root.after(0, lambda: self._open_pinned_picker(pinned, fresh))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
                 self.root.after(0, self._hide_progress)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _open_pinned_picker(self, pinned, fresh_group):
+        self._hide_progress()
+
+        if fresh_group and fresh_group.get("members"):
+            self.selected_group = fresh_group
+            idx = self.group_combo.current()
+            if 0 <= idx < len(self.groups):
+                self.groups[idx] = fresh_group
+
+        if not pinned:
+            self._tc(self.results_text)
+            self._tw(
+                self.results_text,
+                "  No pinned messages found.\n\n"
+                "  This can happen if:\n"
+                "  - The group has no pinned messages\n"
+                "  - Pinned messages are outside the loaded message range\n\n"
+                "  Tip: Try increasing the message load count and retry.\n",
+                "dim",
+            )
+            self._status("No pinned messages found.")
+            return
+
+        # If only 1 pinned message, skip picker and go straight to results
+        if len(pinned) == 1:
+            self._render_pinned(pinned, fresh_group)
+            return
+
+        # ── Pinned Message Picker Dialog ──
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Pinned Messages")
+        dlg.geometry("550x420")
+        dlg.configure(bg=C["bg"])
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Pinned Messages", style="Header.TLabel").pack(
+            pady=(12, 2), padx=16
+        )
+        ttk.Label(
+            dlg,
+            text=f"{len(pinned)} pinned message(s) found. "
+            "Select one or check all at once.",
+            style="Sub.TLabel",
+        ).pack(padx=16, pady=(0, 8))
+
+        # Pinned message listbox
+        lf = ttk.Frame(dlg)
+        lf.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+
+        listbox = tk.Listbox(
+            lf,
+            font=("Consolas", 9),
+            selectmode=tk.SINGLE,
+            bg=C["surface"],
+            fg=C["text"],
+            selectbackground=C["accent"],
+            selectforeground=C["bright"],
+            borderwidth=0,
+            highlightthickness=1,
+            highlightcolor=C["border"],
+            highlightbackground=C["border"],
+        )
+        lsb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=listbox.yview)
+        listbox.configure(yscrollcommand=lsb.set)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for i, msg in enumerate(pinned, 1):
+            ts = datetime.fromtimestamp(msg.get("created_at", 0)).strftime(
+                "%m/%d %H:%M"
+            )
+            sender = msg.get("name", "???")[:14]
+            text = (msg.get("text") or "(media/attachment)")[:40].replace("\n", " ")
+            likes = len(msg.get("favorited_by", []))
+            indicators = self._attachment_indicators(msg)
+            if indicators:
+                text = (
+                    f"{indicators} {text}"
+                    if text != "(media/attachment)"
+                    else indicators
+                )
+            listbox.insert(tk.END, f"  #{i}  [{ts}]  {sender}  ({likes}L)  {text}")
+
+        # Buttons
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill=tk.X, padx=16, pady=(0, 12))
+
+        def check_selected():
+            sel = listbox.curselection()
+            if not sel:
+                messagebox.showwarning(
+                    "No Selection", "Please select a pinned message."
+                )
+                return
+            dlg.destroy()
+            self._render_pinned([pinned[sel[0]]], fresh_group)
+
+        def check_all():
+            dlg.destroy()
+            self._render_pinned(pinned, fresh_group)
+
+        ttk.Button(
+            btn_frame, text="Cancel", style="Small.TButton", command=dlg.destroy
+        ).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(btn_frame, text="Check All", command=check_all).pack(
+            side=tk.RIGHT, padx=(4, 0)
+        )
+        ttk.Button(
+            btn_frame,
+            text="Check Selected",
+            style="Action.TButton",
+            command=check_selected,
+        ).pack(side=tk.RIGHT)
+
+        self._status(f"Found {len(pinned)} pinned messages")
 
     def _render_pinned(self, pinned, fresh_group):
         self._hide_progress()

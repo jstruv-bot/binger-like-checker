@@ -1813,17 +1813,23 @@ class BingerApp:
             try:
                 pinned = []
 
-                # Fast path: scan already-loaded messages first (instant)
-                if self.messages:
-                    pinned = [
-                        m
-                        for m in self.messages
-                        if m.get("pinned_by") or m.get("pinned_at")
-                    ]
+                # If no messages loaded yet, fetch them automatically
+                msgs = self.messages
+                if not msgs:
+                    self.root.after(
+                        0, lambda: self._status("Loading messages for pin scan...")
+                    )
+                    try:
+                        limit = max(20, min(int(self.msg_limit_var.get()), 500))
+                    except ValueError:
+                        limit = 100
+                    msgs = fetch_messages_bulk(self.api, gid, limit)
+                    self.messages = msgs
+                    self._msg_cache[gid] = (time.time(), msgs)
+                    self.root.after(0, self._populate_messages)
 
-                # Slow path: only hit API if no messages loaded or scan found nothing
-                if not pinned:
-                    pinned = self.api.get_pinned_messages(gid)
+                # Scan loaded messages for pinned flags (instant)
+                pinned = [m for m in msgs if m.get("pinned_by") or m.get("pinned_at")]
 
                 # Refresh group for fresh members
                 fresh = None

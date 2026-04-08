@@ -1451,37 +1451,160 @@ class BingerApp:
             except Exception as e:
                 messagebox.showerror("Error", str(e))
 
+    def _build_shame_text(self, template, not_liked, msg_preview):
+        """Build the final shame message from a template string.
+        Placeholders:
+            {count}   - number of non-likers
+            {names}   - numbered list of non-likers
+            {message}  - preview of the original message
+            {group}   - group name
+        """
+        numbered = "\n".join(f"{i}. {n}" for i, n in enumerate(not_liked, 1))
+        group_name = (self.selected_group or {}).get("name", "the group")
+        return (
+            template.replace("{count}", str(len(not_liked)))
+            .replace("{names}", numbered)
+            .replace("{message}", msg_preview)
+            .replace("{group}", group_name)
+        )
+
+    def _get_default_shame_template(self):
+        return (
+            "BINGER LIKE CHECKER REPORT\n"
+            'The following {count} member(s) did NOT like: "{message}"\n\n'
+            "{names}\n\n"
+            "Like the message. You've been warned."
+        )
+
     def _send_shame_message(self):
         if not getattr(self, "_last_not_liked", None) or not self.selected_group:
             return
-        names = ", ".join(self._last_not_liked)
-        preview = getattr(self, "_last_msg_text", "a message")[:50]
-        if not messagebox.askyesno(
-            "Send Shame List",
-            f"Send a message calling out {len(self._last_not_liked)} member(s) "
-            f'who didn\'t like: "{preview}"?\n\nMembers: {names}',
-        ):
+        if not self.api:
             return
-        txt = (
-            f"BINGER LIKE CHECKER REPORT\n"
-            f"The following {len(self._last_not_liked)} member(s) did NOT like: "
-            f'"{preview}"\n\n'
+
+        not_liked = self._last_not_liked
+        msg_preview = getattr(self, "_last_msg_text", "a message")[:50]
+
+        # Load saved template or use default
+        cfg = load_config()
+        saved_template = cfg.get("shame_template", "")
+        template = (
+            saved_template if saved_template else self._get_default_shame_template()
         )
-        for i, n in enumerate(self._last_not_liked, 1):
-            txt += f"{i}. {n}\n"
-        txt += "\nLike the message. You've been warned."
 
-        def work():
-            try:
-                self.api.send_message(self.selected_group["id"], txt)
-                self.root.after(0, lambda: self._status("Shame message sent!"))
-                self.root.after(
-                    0, lambda: messagebox.showinfo("Sent", "Shame message sent!")
-                )
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+        # ── Shame Editor Dialog ──
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Customize Shame Message")
+        dlg.geometry("600x520")
+        dlg.configure(bg=C["bg"])
+        dlg.transient(self.root)
+        dlg.grab_set()
 
-        threading.Thread(target=work, daemon=True).start()
+        ttk.Label(dlg, text="Shame Message Editor", style="Header.TLabel").pack(
+            pady=(12, 2), padx=16
+        )
+        ttk.Label(
+            dlg,
+            text="Edit the template below. Use placeholders: {count} {names} {message} {group}",
+            style="Sub.TLabel",
+        ).pack(padx=16, pady=(0, 8))
+
+        # Template editor
+        ttk.Label(dlg, text="TEMPLATE", style="Accent.TLabel").pack(
+            anchor=tk.W, padx=16, pady=(4, 2)
+        )
+        tmpl_text = tk.Text(
+            dlg,
+            height=8,
+            font=("Consolas", 10),
+            wrap=tk.WORD,
+            bg=C["surface"],
+            fg=C["text"],
+            insertbackground=C["text"],
+            selectbackground=C["accent"],
+            selectforeground=C["bright"],
+            borderwidth=0,
+            highlightthickness=1,
+            highlightcolor=C["border"],
+            highlightbackground=C["border"],
+        )
+        tmpl_text.pack(fill=tk.X, padx=16, pady=(0, 8))
+        tmpl_text.insert("1.0", template)
+
+        # Live preview
+        ttk.Label(dlg, text="PREVIEW", style="Accent.TLabel").pack(
+            anchor=tk.W, padx=16, pady=(4, 2)
+        )
+        preview_text = tk.Text(
+            dlg,
+            height=8,
+            font=("Consolas", 9),
+            wrap=tk.WORD,
+            state="disabled",
+            bg=C["bg2"],
+            fg=C["dim"],
+            borderwidth=0,
+            highlightthickness=1,
+            highlightcolor=C["border"],
+            highlightbackground=C["border"],
+        )
+        preview_text.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+
+        def update_preview(*_args):
+            current = tmpl_text.get("1.0", tk.END).strip()
+            rendered = self._build_shame_text(current, not_liked, msg_preview)
+            preview_text.config(state="normal")
+            preview_text.delete("1.0", tk.END)
+            preview_text.insert("1.0", rendered)
+            preview_text.config(state="disabled")
+
+        tmpl_text.bind("<KeyRelease>", update_preview)
+        update_preview()  # initial render
+
+        # Buttons
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill=tk.X, padx=16, pady=(0, 12))
+
+        def reset_template():
+            tmpl_text.delete("1.0", tk.END)
+            tmpl_text.insert("1.0", self._get_default_shame_template())
+            update_preview()
+
+        def send():
+            current = tmpl_text.get("1.0", tk.END).strip()
+            final = self._build_shame_text(current, not_liked, msg_preview)
+
+            # Save template for future use
+            cfg = load_config()
+            cfg["shame_template"] = current
+            save_config(cfg)
+
+            dlg.destroy()
+
+            def work():
+                try:
+                    self.api.send_message(self.selected_group["id"], final)
+                    self.root.after(0, lambda: self._status("Shame message sent!"))
+                    self.root.after(
+                        0, lambda: messagebox.showinfo("Sent", "Shame message sent!")
+                    )
+                except Exception as e:
+                    self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        ttk.Button(
+            btn_frame,
+            text="Reset to Default",
+            style="Small.TButton",
+            command=reset_template,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(
+            btn_frame, text="Cancel", style="Small.TButton", command=dlg.destroy
+        ).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(
+            btn_frame, text="Send to Group", style="Danger.TButton", command=send
+        ).pack(side=tk.RIGHT)
 
     # ════════════════════════════════════════════════════════
     #  LEADERBOARD

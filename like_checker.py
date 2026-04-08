@@ -108,6 +108,13 @@ class GroupMeAPI:
             p["before_id"] = before_id
         return self._get(f"/groups/{gid}/messages", p)
 
+    def get_pinned_messages(self, gid):
+        """Fetch pinned messages for a group (undocumented endpoint)."""
+        try:
+            return self._get(f"/conversations/{gid}/pinned_messages") or []
+        except Exception:
+            return []
+
     def send_message(self, gid, text):
         payload = {"message": {"source_guid": str(uuid.uuid4()), "text": text}}
         r = self.session.post(
@@ -885,6 +892,14 @@ class BingerApp:
             state="disabled",
         )
         self.check_btn.pack(side=tk.LEFT)
+        self.pinned_btn = ttk.Button(
+            ar,
+            text="Pinned Msgs",
+            style="Small.TButton",
+            command=self._check_pinned,
+            state="disabled",
+        )
+        self.pinned_btn.pack(side=tk.LEFT, padx=(8, 0))
         rr = ttk.Frame(ar)
         rr.pack(side=tk.RIGHT)
         self.copy_btn = ttk.Button(
@@ -940,6 +955,14 @@ class BingerApp:
             state="disabled",
         )
         self.lb_run_btn.pack(side=tk.LEFT)
+        self.lb_report_btn = ttk.Button(
+            cf,
+            text="Member Report",
+            style="Small.TButton",
+            command=self._open_member_report,
+            state="disabled",
+        )
+        self.lb_report_btn.pack(side=tk.LEFT, padx=(8, 0))
         # Feature 10: Copy and Export buttons on Leaderboard tab
         self.lb_copy_btn = ttk.Button(
             cf,
@@ -1243,11 +1266,13 @@ class BingerApp:
         # Disable buttons
         self.load_msgs_btn.config(state="disabled")
         self.excl_btn.config(state="disabled")
+        self.pinned_btn.config(state="disabled")
         self.check_btn.config(state="disabled")
         self.copy_btn.config(state="disabled")
         self.export_btn.config(state="disabled")
         self.shame_btn.config(state="disabled")
         self.lb_run_btn.config(state="disabled")
+        self.lb_report_btn.config(state="disabled")
         self.lb_copy_btn.config(state="disabled")
         self.lb_export_btn.config(state="disabled")
         self.an_run_btn.config(state="disabled")
@@ -1273,7 +1298,9 @@ class BingerApp:
         self._status(f"Group: {self.selected_group['name']}  |  {mc} members")
         self.load_msgs_btn.config(state="normal")
         self.excl_btn.config(state="normal")
+        self.pinned_btn.config(state="normal")
         self.lb_run_btn.config(state="normal")
+        self.lb_report_btn.config(state="normal")
         self.an_run_btn.config(state="normal")
         self.hist_refresh_btn.config(state="normal")
         self.hist_offenders_btn.config(state="normal")
@@ -1476,11 +1503,38 @@ class BingerApp:
         return name[: width - 2] + ".."
 
     @staticmethod
+    def _attachment_indicators(msg):
+        """Build short indicators for message attachments."""
+        TYPE_MAP = {
+            "image": "[IMG]",
+            "video": "[VID]",
+            "location": "[LOC]",
+            "poll": "[POLL]",
+            "event": "[EVT]",
+            "file": "[FILE]",
+        }
+        parts = []
+        for att in msg.get("attachments", []):
+            atype = att.get("type", "")
+            if atype == "emoji":
+                continue
+            parts.append(TYPE_MAP.get(atype, "[+]"))
+        return "".join(parts)
+
+    @staticmethod
     def _format_msg_row(msg):
         """Format a message dict into a listbox display string."""
         ts = datetime.fromtimestamp(msg.get("created_at", 0)).strftime("%m/%d %H:%M")
         name = BingerApp._truncate_name(msg.get("name", "???"), 14)
-        text = (msg.get("text") or "(attachment)")[:50].replace("\n", " ")
+        indicators = BingerApp._attachment_indicators(msg)
+        raw_text = msg.get("text") or ""
+        if indicators and raw_text:
+            text = f"{indicators} {raw_text}"
+        elif indicators:
+            text = indicators
+        else:
+            text = raw_text or "(no text)"
+        text = text[:50].replace("\n", " ")
         likes = len(msg.get("favorited_by", []))
         h = "+" if likes > 0 else " "
         return f" [{ts}] {name} {h}{str(likes).rjust(2)}L  {text}"
@@ -1723,6 +1777,116 @@ class BingerApp:
                     f"{nl} non-likers {'(toast sent)' if sent else '(toast failed)'}\n",
                     "not_liked",
                 )
+
+    # ──────────────── PINNED MESSAGES QUICK-CHECK ────────────────
+    def _check_pinned(self):
+        if not self.selected_group or not self.api:
+            return
+        self._tc(self.results_text)
+        self._status("Fetching pinned messages...")
+        self._show_progress()
+        gid = self.selected_group["id"]
+
+        def work():
+            try:
+                pinned = self.api.get_pinned_messages(gid)
+                # Refresh group for fresh members
+                fresh = None
+                try:
+                    fresh = self.api.get_group(gid)
+                except Exception:
+                    pass
+                self.root.after(0, lambda: self._render_pinned(pinned, fresh))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                self.root.after(0, self._hide_progress)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_pinned(self, pinned, fresh_group):
+        self._hide_progress()
+        self._tc(self.results_text)
+
+        if fresh_group and fresh_group.get("members"):
+            self.selected_group = fresh_group
+            idx = self.group_combo.current()
+            if 0 <= idx < len(self.groups):
+                self.groups[idx] = fresh_group
+
+        if not pinned:
+            self._tw(
+                self.results_text,
+                "  No pinned messages found or pinned messages not supported "
+                "for this group.\n",
+                "dim",
+            )
+            self._status("No pinned messages found.")
+            return
+
+        mm = self._get_member_map(self.selected_group)
+        gid = self.selected_group["id"]
+        excluded_set = self.excluded_ids.get(gid, set())
+        active_ids = {uid for uid in mm if uid not in excluded_set}
+
+        out = []
+        W = lambda t, tag=None: out.append((t, tag))
+        total_nl = 0
+
+        W(f"PINNED MESSAGES CHECK  ({len(pinned)} messages)\n", "header")
+        W("=" * 56 + "\n\n", "sep")
+
+        for pi, msg in enumerate(pinned, 1):
+            liked_ids = set(msg.get("favorited_by", []))
+            liked = [
+                mm[u]
+                for u in sorted(active_ids, key=lambda u: mm[u].lower())
+                if u in liked_ids
+            ]
+            not_liked = [
+                mm[u]
+                for u in sorted(active_ids, key=lambda u: mm[u].lower())
+                if u not in liked_ids
+            ]
+            total_nl += len(not_liked)
+
+            sender = msg.get("name", "Unknown")
+            text = (msg.get("text") or "(no text)")[:70]
+            ts = datetime.fromtimestamp(msg.get("created_at", 0)).strftime(
+                "%m/%d %H:%M"
+            )
+            total = len(active_ids)
+            lk = len(liked)
+            nl = len(not_liked)
+            pct = (lk / total * 100) if total > 0 else 0
+
+            W(f"  #{pi}  ", "stat")
+            W(f'"{text}"\n', "info")
+            W(f"       By {sender} on {ts}  |  ", "dim")
+            W(f"{lk}/{total} liked ({pct:.0f}%)\n", "pct" if pct >= 80 else "stat")
+
+            if not_liked:
+                W(f"       Didn't like: ", "dim")
+                W(f"{', '.join(not_liked[:10])}", "not_liked")
+                if len(not_liked) > 10:
+                    W(f" +{len(not_liked) - 10} more", "dim")
+                W("\n")
+            else:
+                W("       Everyone liked this!\n", "liked")
+            W("\n")
+
+        W("-" * 56 + "\n", "sep")
+        W(
+            f"  SUMMARY: {len(pinned)} pinned messages checked, "
+            f"{total_nl} total non-likers across all\n",
+            "header",
+        )
+
+        self._tw_batch(self.results_text, out)
+        self.copy_btn.config(state="normal")
+        self.export_btn.config(state="normal")
+        self._status(
+            f"Checked {len(pinned)} pinned messages | {total_nl} total non-likers"
+        )
 
     # ──────────────── COPY / EXPORT / SHAME ────────────────
     def _copy_results(self):
@@ -2084,6 +2248,218 @@ class BingerApp:
         # Feature 10: enable copy/export after rendering
         self.lb_copy_btn.config(state="normal")
         self.lb_export_btn.config(state="normal")
+
+    # ════════════════════════════════════════════════════════
+    #  MEMBER REPORT CARD
+    # ════════════════════════════════════════════════════════
+    def _open_member_report(self):
+        if not self.selected_group:
+            return
+        members = self.selected_group.get("members", [])
+        if not members:
+            messagebox.showinfo("No Members", "This group has no members.")
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Member Report Card")
+        dlg.geometry("350x450")
+        dlg.configure(bg=C["bg"])
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Select a Member", style="Header.TLabel").pack(
+            pady=(12, 2), padx=16
+        )
+        ttk.Label(
+            dlg,
+            text="Choose a member to generate their report card",
+            style="Sub.TLabel",
+        ).pack(padx=16, pady=(0, 8))
+
+        listbox = tk.Listbox(
+            dlg,
+            font=("Consolas", 10),
+            bg=C["surface"],
+            fg=C["text"],
+            selectbackground=C["accent"],
+            selectforeground=C["bright"],
+            borderwidth=0,
+            highlightthickness=1,
+            highlightcolor=C["border"],
+            highlightbackground=C["border"],
+        )
+        listbox.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+
+        sorted_members = sorted(members, key=lambda m: m.get("nickname", "").lower())
+        for m in sorted_members:
+            listbox.insert(tk.END, f"  {m.get('nickname', 'Unknown')}")
+
+        def on_select():
+            sel = listbox.curselection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Please select a member.")
+                return
+            member = sorted_members[sel[0]]
+            dlg.destroy()
+            self._run_member_report(member)
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill=tk.X, padx=16, pady=(0, 12))
+        ttk.Button(
+            btn_frame, text="Cancel", style="Small.TButton", command=dlg.destroy
+        ).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(btn_frame, text="Generate Report", command=on_select).pack(
+            side=tk.RIGHT
+        )
+
+    def _run_member_report(self, member):
+        if not self.selected_group or not self.api:
+            return
+        self.lb_run_btn.config(state="disabled")
+        self._show_progress()
+        gid = self.selected_group["id"]
+        try:
+            count = max(50, min(int(self.lb_count_var.get()), 2000))
+        except ValueError:
+            count = 200
+
+        def work():
+            try:
+
+                def pcb(n):
+                    self.root.after(
+                        0, lambda: self.lb_status_var.set(f"Fetching... {n} msgs")
+                    )
+
+                msgs = self._get_cached_or_fetch(gid, count, pcb)
+                self.root.after(0, lambda: self._render_member_report(member, msgs))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                self.root.after(0, lambda: self.lb_run_btn.config(state="normal"))
+                self.root.after(0, self._hide_progress)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_member_report(self, member, msgs):
+        self._hide_progress()
+        self.lb_run_btn.config(state="normal")
+        self._tc(self.lb_text)
+
+        if not msgs:
+            self._tw(self.lb_text, "  No messages to analyze.\n", "dim")
+            return
+
+        mm = self._get_member_map(self.selected_group)
+        uid = member.get("user_id", "")
+        nick = member.get("nickname", "Unknown")
+        total_msgs = len(msgs)
+
+        # Compute stats
+        sent = 0
+        likes_given = 0
+        likes_received = 0
+        most_liked_msg = None
+        most_liked_count = -1
+        # Who this member likes most
+        likes_to = Counter()
+        # Who likes this member most
+        likes_from = Counter()
+
+        for m in msgs:
+            sender_id = m.get("user_id", "")
+            fav_by = m.get("favorited_by", [])
+
+            # Messages sent by this member
+            if sender_id == uid:
+                sent += 1
+                lk = len(fav_by)
+                likes_received += lk
+                if lk > most_liked_count:
+                    most_liked_count = lk
+                    most_liked_msg = m
+                # Who likes this member's messages
+                for liker_id in fav_by:
+                    if liker_id in mm and liker_id != uid:
+                        likes_from[liker_id] += 1
+
+            # Likes given by this member
+            if uid in fav_by:
+                likes_given += 1
+                if sender_id in mm and sender_id != uid:
+                    likes_to[sender_id] += 1
+
+        avg_likes = likes_received / sent if sent > 0 else 0
+        like_rate = (likes_given / total_msgs * 100) if total_msgs > 0 else 0
+
+        medal = {0: "gold", 1: "silver", 2: "bronze"}
+        out = []
+        W = lambda t, tag=None: out.append((t, tag))
+
+        W(f"MEMBER REPORT CARD: {nick}\n", "header")
+        W("=" * 56 + "\n\n", "sep")
+
+        W("OVERVIEW\n", "header")
+        W("-" * 56 + "\n", "sep")
+        W(f"  Messages Sent:      {sent}\n", "info")
+        W(
+            f"  Likes Given:        {likes_given}  (liked {like_rate:.0f}% of all msgs)\n",
+            "stat",
+        )
+        W(f"  Likes Received:     {likes_received}\n", "info")
+        W(f"  Avg Likes/Message:  {avg_likes:.1f}\n", "stat")
+        W("\n")
+
+        # Like rate bar
+        bw = 30
+        filled = round(like_rate / 100 * bw)
+        W(f"  Like Rate:  ", "info")
+        W(f"{like_rate:.0f}%", "pct")
+        W(f"  [{('=' * filled) + ('-' * (bw - filled))}]\n", "stat")
+        W("\n")
+
+        # Most liked message
+        if most_liked_msg and most_liked_count > 0:
+            W("MOST LIKED MESSAGE\n", "header")
+            W("-" * 56 + "\n", "sep")
+            ml_text = (most_liked_msg.get("text") or "(no text)")[:70]
+            ml_ts = datetime.fromtimestamp(
+                most_liked_msg.get("created_at", 0)
+            ).strftime("%m/%d %H:%M")
+            W(f'  "{ml_text}"\n', "gold")
+            W(f"  On {ml_ts}  |  {most_liked_count} likes\n", "info")
+            W("\n")
+
+        # Top 5 people this member likes most
+        W("TOP 5: WHO THEY LIKE MOST\n", "header")
+        W("-" * 56 + "\n", "sep")
+        if likes_to:
+            for i, (target_id, cnt) in enumerate(likes_to.most_common(5)):
+                tag = medal.get(i, "liked")
+                W(
+                    f"  {i + 1:>3}  {mm.get(target_id, '?'):<20} {cnt:>4} likes given\n",
+                    tag,
+                )
+        else:
+            W("  No likes given to anyone.\n", "dim")
+        W("\n")
+
+        # Top 5 people who like this member most
+        W("TOP 5: WHO LIKES THEM MOST\n", "header")
+        W("-" * 56 + "\n", "sep")
+        if likes_from:
+            for i, (fan_id, cnt) in enumerate(likes_from.most_common(5)):
+                tag = medal.get(i, "liked")
+                W(
+                    f"  {i + 1:>3}  {mm.get(fan_id, '?'):<20} {cnt:>4} likes given\n",
+                    tag,
+                )
+        else:
+            W("  Nobody has liked their messages.\n", "dim")
+
+        self._tw_batch(self.lb_text, out)
+        self.lb_copy_btn.config(state="normal")
+        self.lb_export_btn.config(state="normal")
+        self.lb_status_var.set(f"Report for {nick} ({total_msgs} msgs analyzed)")
 
     # ════════════════════════════════════════════════════════
     #  HISTORY

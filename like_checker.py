@@ -2049,10 +2049,15 @@ class BingerApp:
 
         # Enable shame list with all unique non-likers across pinned messages
         self._last_not_liked = sorted(all_non_likers, key=str.lower)
-        pin_count = len(pinned)
-        self._last_msg_text = (
-            f"{pin_count} pinned message{'s' if pin_count != 1 else ''}"
-        )
+        if len(pinned) == 1:
+            self._last_msg_text = pinned[0].get("text") or "(pinned media)"
+        else:
+            # Combine previews of all pinned messages
+            previews = []
+            for m in pinned:
+                t = (m.get("text") or "(media)")[:30]
+                previews.append(t)
+            self._last_msg_text = " | ".join(previews)
         self.shame_btn.config(state="normal" if self._last_not_liked else "disabled")
 
         self._status(

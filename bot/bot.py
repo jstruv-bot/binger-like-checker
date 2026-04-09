@@ -27,8 +27,8 @@ Setup:
 
 import os
 import json
-import re
 import sqlite3
+import time
 import threading
 from collections import Counter
 from datetime import datetime
@@ -56,7 +56,7 @@ DB_FILE = os.path.join(CONFIG_DIR, "bot.db")
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────────────────────────────
-#  API CLIENT
+#  API CLIENT (with member map caching)
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -72,7 +72,9 @@ class GroupMeAPI:
         )
         adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
         self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
+        # Member map cache: (timestamp, member_map)
+        self._mm_cache = {}
+        self._mm_ttl = 60  # seconds
 
     def _get(self, endpoint, params=None):
         if params is None:
@@ -92,13 +94,19 @@ class GroupMeAPI:
         return self._get(f"/groups/{gid}/messages", p)
 
     def get_member_map(self, gid):
-        """Get user_id -> nickname map for the group."""
+        """Get user_id -> nickname map, cached for 60s."""
+        cached = self._mm_cache.get(gid)
+        if cached:
+            ts, mm = cached
+            if time.time() - ts < self._mm_ttl:
+                return mm
         group = self.get_group(gid)
         mm = {}
         for m in group.get("members", []):
             uid = m.get("user_id")
             if uid:
                 mm[uid] = m.get("nickname", "Unknown")
+        self._mm_cache[gid] = (time.time(), mm)
         return mm
 
     def fetch_messages(self, gid, count):
@@ -119,11 +127,50 @@ class GroupMeAPI:
                 break
         return all_msgs
 
+    def fetch_sir_messages(self, gid, sir_ids, count):
+        """Fetch messages until `count` Sir messages are found.
+        Smarter than fetching a fixed number -- stops early once enough are found."""
+        sir_msgs = []
+        before_id = None
+        fetched = 0
+        max_fetch = count * 20 + 100  # safety cap
+        while len(sir_msgs) < count and fetched < max_fetch:
+            batch_size = min(100, max_fetch - fetched)
+            result = self.get_messages(gid, before_id=before_id, limit=batch_size)
+            if not result or not result.get("messages"):
+                break
+            batch = result["messages"]
+            for m in batch:
+                if m.get("user_id") in sir_ids:
+                    sir_msgs.append(m)
+                    if len(sir_msgs) >= count:
+                        break
+            fetched += len(batch)
+            before_id = batch[-1]["id"]
+            if len(batch) < batch_size:
+                break
+        return sir_msgs
 
-api = GroupMeAPI(TOKEN)
+    def post_bot_message(self, text):
+        """Send a bot message using the pooled session with retry."""
+        self.session.post(
+            BOT_POST_URL, json={"bot_id": BOT_ID, "text": text}, timeout=10
+        )
+
+
+# Lazy-initialized: created on first use, not at import time
+_api = None
+
+
+def get_api():
+    global _api
+    if _api is None:
+        _api = GroupMeAPI(TOKEN)
+    return _api
+
 
 # ─────────────────────────────────────────────────────────────────────
-#  DATABASE (Sirs, Exclusions, Last Check)
+#  DATABASE
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -157,7 +204,6 @@ class BotDB:
         """)
         self.conn.commit()
 
-    # ── Sirs ──
     def get_sirs(self, gid):
         with self._lock:
             rows = self.conn.execute(
@@ -168,8 +214,7 @@ class BotDB:
     def add_sir(self, gid, uid, nickname):
         with self._lock:
             self.conn.execute(
-                "INSERT OR REPLACE INTO sirs (group_id, user_id, nickname) VALUES (?,?,?)",
-                (gid, uid, nickname),
+                "INSERT OR REPLACE INTO sirs VALUES (?,?,?)", (gid, uid, nickname)
             )
             self.conn.commit()
 
@@ -180,7 +225,6 @@ class BotDB:
             )
             self.conn.commit()
 
-    # ── Exclusions ──
     def get_exclusions(self, gid):
         with self._lock:
             rows = self.conn.execute(
@@ -191,8 +235,7 @@ class BotDB:
     def add_exclusion(self, gid, uid, nickname):
         with self._lock:
             self.conn.execute(
-                "INSERT OR REPLACE INTO exclusions (group_id, user_id, nickname) VALUES (?,?,?)",
-                (gid, uid, nickname),
+                "INSERT OR REPLACE INTO exclusions VALUES (?,?,?)", (gid, uid, nickname)
             )
             self.conn.commit()
 
@@ -203,11 +246,10 @@ class BotDB:
             )
             self.conn.commit()
 
-    # ── Last Check (for !shame) ──
     def save_last_check(self, gid, not_liked_names, msg_preview):
         with self._lock:
             self.conn.execute(
-                "INSERT OR REPLACE INTO last_check (group_id, not_liked, msg_preview) VALUES (?,?,?)",
+                "INSERT OR REPLACE INTO last_check VALUES (?,?,?)",
                 (gid, json.dumps(not_liked_names), msg_preview),
             )
             self.conn.commit()
@@ -222,7 +264,16 @@ class BotDB:
         return [], ""
 
 
-db = BotDB()
+# Lazy-initialized
+_db = None
+
+
+def get_db():
+    global _db
+    if _db is None:
+        _db = BotDB()
+    return _db
+
 
 # ─────────────────────────────────────────────────────────────────────
 #  BOT MESSAGING
@@ -230,8 +281,9 @@ db = BotDB()
 
 
 def send_bot_message(text):
-    """Send a message as the bot. Splits long messages."""
-    MAX_LEN = 990  # GroupMe limit is 1000, leave margin
+    """Send a message as the bot. Splits long messages with delay between chunks."""
+    api = get_api()
+    MAX_LEN = 990
     chunks = []
     while len(text) > MAX_LEN:
         split_at = text.rfind("\n", 0, MAX_LEN)
@@ -241,16 +293,18 @@ def send_bot_message(text):
         text = text[split_at:].lstrip("\n")
     chunks.append(text)
 
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         if chunk.strip():
-            requests.post(
-                BOT_POST_URL, json={"bot_id": BOT_ID, "text": chunk.strip()}, timeout=10
-            )
+            api.post_bot_message(chunk.strip())
+            if i < len(chunks) - 1:
+                time.sleep(0.3)  # avoid rate limits between chunks
 
 
 def find_member_by_name(mm, name):
     """Find a member by partial name match. Returns (user_id, nickname) or None."""
     name_lower = name.lower().strip().lstrip("@")
+    if not name_lower:
+        return None
     # Exact match first
     for uid, nick in mm.items():
         if nick.lower() == name_lower:
@@ -262,12 +316,51 @@ def find_member_by_name(mm, name):
     return None
 
 
+def get_context():
+    """Get common context (api, db, sirs, exclusions, member_map) in one call."""
+    api = get_api()
+    db = get_db()
+    sirs = db.get_sirs(GROUP_ID)
+    excl = db.get_exclusions(GROUP_ID)
+    mm = api.get_member_map(GROUP_ID)
+    return api, db, sirs, excl, mm
+
+
 # ─────────────────────────────────────────────────────────────────────
-#  COMMAND HANDLERS
+#  RATE LIMITING
+# ─────────────────────────────────────────────────────────────────────
+
+_last_cmd_time = {}
+_cmd_cooldown = 3  # seconds between same command
+
+
+def check_rate_limit(cmd):
+    """Returns True if the command is rate-limited (should be blocked)."""
+    now = time.time()
+    last = _last_cmd_time.get(cmd, 0)
+    if now - last < _cmd_cooldown:
+        return True
+    _last_cmd_time[cmd] = now
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  COMMAND HANDLERS (all wrapped in try/except)
 # ─────────────────────────────────────────────────────────────────────
 
 
-def cmd_help():
+def safe_run(func, args):
+    """Run a command handler with error reporting."""
+    try:
+        func(args)
+    except Exception as e:
+        try:
+            send_bot_message(f"Error: {str(e)[:200]}")
+        except Exception:
+            pass
+
+
+def cmd_help(_args):
     send_bot_message(
         "BINGER BOT COMMANDS\n"
         "====================\n"
@@ -286,17 +379,18 @@ def cmd_help():
     )
 
 
-def cmd_ping():
+def cmd_ping(_args):
     send_bot_message("Binger Bot is alive.")
 
 
-def cmd_sirs():
+def cmd_sirs(_args):
+    db = get_db()
     sirs = db.get_sirs(GROUP_ID)
     if not sirs:
         send_bot_message("No Sirs set. Use !addsir Name to add one.")
         return
     lines = ["CURRENT SIRS", "=" * 20]
-    for i, (uid, nick) in enumerate(sirs.items(), 1):
+    for i, nick in enumerate(sirs.values(), 1):
         lines.append(f"  {i}. {nick}")
     send_bot_message("\n".join(lines))
 
@@ -305,13 +399,14 @@ def cmd_addsir(name):
     if not name:
         send_bot_message("Usage: !addsir Name")
         return
+    api = get_api()
     mm = api.get_member_map(GROUP_ID)
     result = find_member_by_name(mm, name)
     if not result:
         send_bot_message(f'Could not find member "{name}"')
         return
     uid, nick = result
-    db.add_sir(GROUP_ID, uid, nick)
+    get_db().add_sir(GROUP_ID, uid, nick)
     send_bot_message(f"{nick} is now a Sir.")
 
 
@@ -319,14 +414,13 @@ def cmd_removesir(name):
     if not name:
         send_bot_message("Usage: !removesir Name")
         return
-    sirs = db.get_sirs(GROUP_ID)
-    mm = {uid: nick for uid, nick in sirs.items()}
-    result = find_member_by_name(mm, name)
+    sirs = get_db().get_sirs(GROUP_ID)
+    result = find_member_by_name(sirs, name)
     if not result:
         send_bot_message(f'"{name}" is not a Sir.')
         return
     uid, nick = result
-    db.remove_sir(GROUP_ID, uid)
+    get_db().remove_sir(GROUP_ID, uid)
     send_bot_message(f"{nick} is no longer a Sir.")
 
 
@@ -334,13 +428,13 @@ def cmd_exclude(name):
     if not name:
         send_bot_message("Usage: !exclude Name")
         return
-    mm = api.get_member_map(GROUP_ID)
+    mm = get_api().get_member_map(GROUP_ID)
     result = find_member_by_name(mm, name)
     if not result:
         send_bot_message(f'Could not find member "{name}"')
         return
     uid, nick = result
-    db.add_exclusion(GROUP_ID, uid, nick)
+    get_db().add_exclusion(GROUP_ID, uid, nick)
     send_bot_message(f"{nick} is now excluded from checks.")
 
 
@@ -348,35 +442,33 @@ def cmd_unexclude(name):
     if not name:
         send_bot_message("Usage: !unexclude Name")
         return
-    excl = db.get_exclusions(GROUP_ID)
+    excl = get_db().get_exclusions(GROUP_ID)
     result = find_member_by_name(excl, name)
     if not result:
         send_bot_message(f'"{name}" is not excluded.')
         return
     uid, nick = result
-    db.remove_exclusion(GROUP_ID, uid)
+    get_db().remove_exclusion(GROUP_ID, uid)
     send_bot_message(f"{nick} is no longer excluded.")
 
 
-def cmd_check(count_str="1"):
+def cmd_check(count_str):
     try:
-        count = max(1, min(int(count_str), 20))
+        count = max(1, min(int(count_str or "1"), 20))
     except ValueError:
         count = 1
 
-    sirs = db.get_sirs(GROUP_ID)
+    api, db, sirs, excl, mm = get_context()
     if not sirs:
         send_bot_message("No Sirs set. Use !addsir Name first.")
         return
 
     sir_ids = set(sirs.keys())
-    excl = set(db.get_exclusions(GROUP_ID).keys())
-    mm = api.get_member_map(GROUP_ID)
-    active_ids = {uid for uid in mm if uid not in excl}
+    excl_ids = set(excl.keys())
+    active_ids = {uid for uid in mm if uid not in excl_ids}
 
-    # Fetch enough messages to find N Sir messages
-    msgs = api.fetch_messages(GROUP_ID, count * 10 + 50)
-    sir_msgs = [m for m in msgs if m.get("user_id") in sir_ids][:count]
+    # Smart fetch: find exactly N Sir messages
+    sir_msgs = api.fetch_sir_messages(GROUP_ID, sir_ids, count)
 
     if not sir_msgs:
         send_bot_message("No Sir messages found in recent history.")
@@ -384,32 +476,34 @@ def cmd_check(count_str="1"):
 
     all_non_likers = set()
     lines = [
-        f"BINGER CHECK ({len(sir_msgs)} Sir message{'s' if len(sir_msgs) != 1 else ''})",
+        f"BINGER CHECK ({len(sir_msgs)} Sir msg{'s' if len(sir_msgs) != 1 else ''})",
         "=" * 40,
     ]
 
     for i, msg in enumerate(sir_msgs, 1):
         liked_ids = set(msg.get("favorited_by", []))
+        sender_id = msg.get("user_id", "")
         not_liked = [
             mm[u]
             for u in sorted(active_ids, key=lambda u: mm[u].lower())
-            if u not in liked_ids and u != msg.get("user_id")
+            if u not in liked_ids and u != sender_id
         ]
         all_non_likers.update(not_liked)
 
         sender = msg.get("name", "?")
         text = (msg.get("text") or "(media)")[:40]
         ts = datetime.fromtimestamp(msg.get("created_at", 0)).strftime("%m/%d %H:%M")
-        total = len(active_ids) - 1  # exclude sender
+        total = len(active_ids) - (1 if sender_id in active_ids else 0)
         lk = total - len(not_liked)
         pct = (lk / total * 100) if total > 0 else 0
 
         lines.append(f'\n#{i} "{text}"')
         lines.append(f"   By {sender} on {ts} | {lk}/{total} liked ({pct:.0f}%)")
         if not_liked:
-            lines.append(f"   Didn't like: {', '.join(not_liked[:10])}")
+            nl_str = ", ".join(not_liked[:10])
             if len(not_liked) > 10:
-                lines[-1] += f" +{len(not_liked) - 10} more"
+                nl_str += f" +{len(not_liked) - 10} more"
+            lines.append(f"   Didn't like: {nl_str}")
         else:
             lines.append("   Everyone liked this!")
 
@@ -417,28 +511,26 @@ def cmd_check(count_str="1"):
         f"\n{len(all_non_likers)} unique non-liker{'s' if len(all_non_likers) != 1 else ''} total"
     )
 
-    # Save for !shame
     sorted_nl = sorted(all_non_likers, key=str.lower)
     preview = (sir_msgs[0].get("text") or "(media)")[:50]
     db.save_last_check(GROUP_ID, sorted_nl, preview)
-
     send_bot_message("\n".join(lines))
 
 
-def cmd_leaderboard(count_str="200"):
+def cmd_leaderboard(count_str):
     try:
-        count = max(50, min(int(count_str), 2000))
+        count = max(50, min(int(count_str or "200"), 2000))
     except ValueError:
         count = 200
 
-    sirs = db.get_sirs(GROUP_ID)
+    api, db, sirs, excl, mm = get_context()
     if not sirs:
         send_bot_message("No Sirs set. Use !addsir Name first.")
         return
 
     sir_ids = set(sirs.keys())
-    excl = set(db.get_exclusions(GROUP_ID).keys())
-    mm = api.get_member_map(GROUP_ID)
+    excl_ids = set(excl.keys())
+    active_ids = {uid for uid in mm if uid not in excl_ids}
 
     msgs = api.fetch_messages(GROUP_ID, count)
 
@@ -447,22 +539,23 @@ def cmd_leaderboard(count_str="200"):
 
     for m in msgs:
         sender_id = m.get("user_id", "")
-        if sender_id in sir_ids:
-            sir_msg_count += 1
-            fav_set = set(m.get("favorited_by", []))
-            for uid in mm:
-                if uid not in excl and uid != sender_id and uid not in fav_set:
-                    non_likes[uid] += 1
+        if sender_id not in sir_ids:
+            continue
+        sir_msg_count += 1
+        fav_set = set(m.get("favorited_by", []))
+        for uid in active_ids:
+            if uid != sender_id and uid not in fav_set:
+                non_likes[uid] += 1
 
     if sir_msg_count == 0:
         send_bot_message("No Sir messages found in the scanned range.")
         return
 
-    sir_names = [sirs.get(uid, "?") for uid in sir_ids]
+    sir_names = [sirs[uid] for uid in sir_ids if uid in sirs]
     lines = [
-        f"SIR NON-LIKER LEADERBOARD",
+        "SIR NON-LIKER LEADERBOARD",
         f"Sirs: {', '.join(sir_names)}",
-        f"{sir_msg_count} Sir messages scanned ({count} total)",
+        f"{sir_msg_count} Sir messages in {len(msgs)} scanned",
         "=" * 35,
     ]
 
@@ -482,14 +575,13 @@ def cmd_report(name):
         send_bot_message("Usage: !report Name")
         return
 
-    mm = api.get_member_map(GROUP_ID)
+    api, db, sirs, excl, mm = get_context()
     result = find_member_by_name(mm, name)
     if not result:
         send_bot_message(f'Could not find member "{name}"')
         return
 
     uid, nick = result
-    sirs = db.get_sirs(GROUP_ID)
     sir_ids = set(sirs.keys())
 
     msgs = api.fetch_messages(GROUP_ID, 200)
@@ -519,12 +611,12 @@ def cmd_report(name):
     total_msgs = len(msgs)
     like_rate = (likes_given / total_msgs * 100) if total_msgs else 0
     avg_likes = likes_received / sent if sent else 0
-    sir_pct = (sir_missed / sir_total * 100) if sir_total else 0
 
     lines = [f"REPORT CARD: {nick}", "=" * 30]
 
     if sir_ids:
         sir_liked = sir_total - sir_missed
+        sir_pct = (sir_missed / sir_total * 100) if sir_total else 0
         lines.append(f"\nSIR MESSAGES")
         lines.append(f"  Sir Messages:    {sir_total}")
         lines.append(f"  Liked:           {sir_liked}")
@@ -539,7 +631,8 @@ def cmd_report(name):
     send_bot_message("\n".join(lines))
 
 
-def cmd_shame():
+def cmd_shame(_args):
+    db = get_db()
     not_liked, preview = db.get_last_check(GROUP_ID)
     if not not_liked:
         send_bot_message("No check results to shame. Run !check first.")
@@ -562,17 +655,17 @@ def cmd_shame():
 # ─────────────────────────────────────────────────────────────────────
 
 COMMANDS = {
-    "!help": lambda args: cmd_help(),
-    "!ping": lambda args: cmd_ping(),
-    "!sirs": lambda args: cmd_sirs(),
-    "!addsir": lambda args: cmd_addsir(args),
-    "!removesir": lambda args: cmd_removesir(args),
-    "!exclude": lambda args: cmd_exclude(args),
-    "!unexclude": lambda args: cmd_unexclude(args),
-    "!check": lambda args: cmd_check(args or "1"),
-    "!leaderboard": lambda args: cmd_leaderboard(args or "200"),
-    "!report": lambda args: cmd_report(args),
-    "!shame": lambda args: cmd_shame(),
+    "!help": cmd_help,
+    "!ping": cmd_ping,
+    "!sirs": cmd_sirs,
+    "!addsir": cmd_addsir,
+    "!removesir": cmd_removesir,
+    "!exclude": cmd_exclude,
+    "!unexclude": cmd_unexclude,
+    "!check": cmd_check,
+    "!leaderboard": cmd_leaderboard,
+    "!report": cmd_report,
+    "!shame": cmd_shame,
 }
 
 
@@ -590,15 +683,15 @@ def callback():
     if not text.startswith("!"):
         return "OK", 200
 
-    # Parse command and args
     parts = text.split(None, 1)
     cmd = parts[0].lower()
     args = parts[1].strip() if len(parts) > 1 else ""
 
     handler = COMMANDS.get(cmd)
     if handler:
-        # Run in a thread so we don't block the callback
-        threading.Thread(target=handler, args=(args,), daemon=True).start()
+        if check_rate_limit(cmd):
+            return "OK", 200  # silently ignore spam
+        threading.Thread(target=safe_run, args=(handler, args), daemon=True).start()
 
     return "OK", 200
 
@@ -615,15 +708,12 @@ def health():
 if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: Set GROUPME_TOKEN environment variable")
-        print("  Get your token at https://dev.groupme.com")
         exit(1)
     if not BOT_ID:
         print("ERROR: Set BOT_ID environment variable")
-        print("  Create a bot at https://dev.groupme.com/bots")
         exit(1)
     if not GROUP_ID:
         print("ERROR: Set GROUP_ID environment variable")
-        print("  Find your group ID in the URL at web.groupme.com")
         exit(1)
 
     print(f"Binger Bot starting on port {PORT}...")

@@ -127,6 +127,37 @@ class GroupMeAPI:
                 break
         return all_msgs
 
+    def get_message_by_id(self, gid, message_id):
+        """Fetch a single message by ID. Returns the message dict or None."""
+        # GroupMe doesn't have a single-message endpoint, so we fetch
+        # a small batch around the target message ID
+        try:
+            result = self.get_messages(gid, before_id=str(int(message_id) + 1), limit=1)
+            if result and result.get("messages"):
+                for m in result["messages"]:
+                    if m.get("id") == message_id:
+                        return m
+        except Exception:
+            pass
+        # Fallback: fetch a batch after the message ID and look for it
+        try:
+            result = self.get_messages(gid, before_id=message_id, limit=1)
+            # The message we want is the one just before this batch
+            # Try fetching with the message as the "after" boundary
+            p = {"after_id": str(int(message_id) - 1), "limit": 5}
+            p["token"] = self.token
+            r = self.session.get(
+                f"{API_BASE}/groups/{gid}/messages", params=p, timeout=15
+            )
+            r.raise_for_status()
+            resp = r.json().get("response", {})
+            for m in resp.get("messages", []):
+                if m.get("id") == message_id:
+                    return m
+        except Exception:
+            pass
+        return None
+
     def fetch_sir_messages(self, gid, sir_ids, count):
         """Fetch messages until `count` Sir messages are found.
         Smarter than fetching a fixed number -- stops early once enough are found."""
@@ -517,6 +548,50 @@ def cmd_check(count_str):
     send_bot_message("\n".join(lines))
 
 
+def cmd_check_reply(reply_message_id):
+    """Check a specific message by ID (triggered by replying with !check)."""
+    api_inst, db_inst, sirs, excl, mm = get_context()
+    excl_ids = set(excl.keys())
+    active_ids = {uid for uid in mm if uid not in excl_ids}
+
+    msg = api_inst.get_message_by_id(GROUP_ID, reply_message_id)
+    if not msg:
+        send_bot_message("Could not find the replied-to message.")
+        return
+
+    liked_ids = set(msg.get("favorited_by", []))
+    sender_id = msg.get("user_id", "")
+    not_liked = [
+        mm[u]
+        for u in sorted(active_ids, key=lambda u: mm[u].lower())
+        if u not in liked_ids and u != sender_id
+    ]
+
+    sender = msg.get("name", "?")
+    text = (msg.get("text") or "(media)")[:50]
+    ts = datetime.fromtimestamp(msg.get("created_at", 0)).strftime("%m/%d %H:%M")
+    total = len(active_ids) - (1 if sender_id in active_ids else 0)
+    lk = total - len(not_liked)
+    pct = (lk / total * 100) if total > 0 else 0
+
+    lines = [
+        f'BINGER CHECK: "{text}"',
+        f"By {sender} on {ts} | {lk}/{total} liked ({pct:.0f}%)",
+        "=" * 35,
+    ]
+    if not_liked:
+        lines.append(f"Didn't like ({len(not_liked)}):")
+        for i, n in enumerate(not_liked, 1):
+            lines.append(f"  {i}. {n}")
+    else:
+        lines.append("Everyone liked this!")
+
+    # Save for !shame
+    sorted_nl = sorted(not_liked, key=str.lower) if not_liked else []
+    db_inst.save_last_check(GROUP_ID, sorted_nl, text)
+    send_bot_message("\n".join(lines))
+
+
 def cmd_leaderboard(count_str):
     try:
         count = max(50, min(int(count_str or "200"), 2000))
@@ -683,9 +758,24 @@ def callback():
     if not text.startswith("!"):
         return "OK", 200
 
+    # Check if this is a reply to a specific message
+    reply_id = None
+    for att in data.get("attachments", []):
+        if att.get("type") == "reply":
+            reply_id = att.get("reply_id")
+            break
+
     parts = text.split(None, 1)
     cmd = parts[0].lower()
     args = parts[1].strip() if len(parts) > 1 else ""
+
+    # If replying to a message with !check, check that specific message
+    if cmd == "!check" and reply_id:
+        if not check_rate_limit("!check_reply"):
+            threading.Thread(
+                target=safe_run, args=(cmd_check_reply, reply_id), daemon=True
+            ).start()
+        return "OK", 200
 
     handler = COMMANDS.get(cmd)
     if handler:

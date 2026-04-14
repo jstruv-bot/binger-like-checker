@@ -496,7 +496,7 @@ def cmd_check(count_str):
 
     sir_ids = set(sirs.keys())
     excl_ids = set(excl.keys())
-    active_ids = {uid for uid in mm if uid not in excl_ids}
+    active_ids = {uid for uid in mm if uid not in excl_ids and uid not in sir_ids}
 
     # Smart fetch: find exactly N Sir messages
     sir_msgs = api.fetch_sir_messages(GROUP_ID, sir_ids, count)
@@ -551,8 +551,9 @@ def cmd_check(count_str):
 def cmd_check_reply(reply_message_id):
     """Check a specific message by ID (triggered by replying with !check)."""
     api_inst, db_inst, sirs, excl, mm = get_context()
+    sir_ids = set(sirs.keys())
     excl_ids = set(excl.keys())
-    active_ids = {uid for uid in mm if uid not in excl_ids}
+    active_ids = {uid for uid in mm if uid not in excl_ids and uid not in sir_ids}
 
     msg = api_inst.get_message_by_id(GROUP_ID, reply_message_id)
     if not msg:
@@ -605,7 +606,7 @@ def cmd_leaderboard(count_str):
 
     sir_ids = set(sirs.keys())
     excl_ids = set(excl.keys())
-    active_ids = {uid for uid in mm if uid not in excl_ids}
+    active_ids = {uid for uid in mm if uid not in excl_ids and uid not in sir_ids}
 
     msgs = api.fetch_messages(GROUP_ID, count)
 

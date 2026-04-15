@@ -427,7 +427,6 @@ def cmd_help(_args):
     send_bot_message(
         "BINGER BOT COMMANDS\n"
         "====================\n"
-        "!check        - Check last Sir message\n"
         "!check (reply) - Check replied message\n"
         "!sirs         - List Sirs\n"
         "!addsir Name  - Add a Sir\n"
@@ -790,7 +789,9 @@ COMMANDS = {
     "!removesir": cmd_removesir,
     "!exclude": cmd_exclude,
     "!unexclude": cmd_unexclude,
-    "!check": cmd_check,
+    "!check": lambda args: send_bot_message(
+        "Reply to a message with !check to check it."
+    ),
     "!leaderboard": cmd_leaderboard,
     "!report": cmd_report,
     "!shame": cmd_shame,

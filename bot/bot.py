@@ -736,8 +736,6 @@ def cmd_report(name):
     lines.append(f"\nOVERALL ({total_msgs} msgs scanned)")
     lines.append(f"  Messages Sent:   {sent}")
     lines.append(f"  Likes Given:     {likes_given} ({like_rate:.0f}% of all)")
-    lines.append(f"  Likes Received:  {likes_received}")
-    lines.append(f"  Avg Likes/Msg:   {avg_likes:.1f}")
 
     send_bot_message("\n".join(lines))
 

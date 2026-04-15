@@ -762,7 +762,7 @@ def cmd_shame(_args):
     db = get_db()
     not_liked, preview = db.get_last_check(GROUP_ID)
     if not not_liked:
-        send_bot_message("No check results to shame. Run !check first.")
+        send_bot_message("Reply to a message with !shame to shame non-likers.")
         return
 
     lines = [
@@ -774,6 +774,47 @@ def cmd_shame(_args):
         lines.append(f"{i}. {n}")
     lines.append("\nLike the message. You've been warned.")
 
+    send_bot_message("\n".join(lines))
+
+
+def cmd_shame_reply(reply_message_id):
+    """Check a message and immediately send the shame list."""
+    api_inst, db_inst, sirs, excl, mm = get_context()
+    sir_ids = set(sirs.keys())
+    excl_ids = set(excl.keys())
+    active_ids = {uid for uid in mm if uid not in excl_ids and uid not in sir_ids}
+
+    msg = api_inst.get_message_by_id(GROUP_ID, reply_message_id)
+    if not msg:
+        send_bot_message("Could not find the replied-to message.")
+        return
+
+    sender_id = msg.get("user_id", "")
+    active_ids.discard(sender_id)
+
+    liked_ids = set(msg.get("favorited_by", []))
+    not_liked = [
+        mm[u]
+        for u in sorted(active_ids, key=lambda u: mm[u].lower())
+        if u not in liked_ids
+    ]
+
+    text = (msg.get("text") or "(media)")[:50]
+
+    if not not_liked:
+        send_bot_message(f'Everyone liked: "{text}"')
+        return
+
+    lines = [
+        "BINGER LIKE CHECKER REPORT",
+        f'The following {len(not_liked)} member(s) did NOT like: "{text}"',
+        "",
+    ]
+    for i, n in enumerate(not_liked, 1):
+        lines.append(f"{i}. {n}")
+    lines.append("\nLike the message. You've been warned.")
+
+    db_inst.save_last_check(GROUP_ID, not_liked, text)
     send_bot_message("\n".join(lines))
 
 
@@ -824,11 +865,12 @@ def callback():
     cmd = parts[0].lower()
     args = parts[1].strip() if len(parts) > 1 else ""
 
-    # If replying to a message with !check, check that specific message
-    if cmd == "!check" and reply_id:
-        if not check_rate_limit("!check_reply"):
+    # If replying to a message with !check or !shame, target that specific message
+    if reply_id and cmd in ("!check", "!shame"):
+        handler_fn = cmd_shame_reply if cmd == "!shame" else cmd_check_reply
+        if not check_rate_limit(f"{cmd}_reply"):
             threading.Thread(
-                target=safe_run, args=(cmd_check_reply, reply_id), daemon=True
+                target=safe_run, args=(handler_fn, reply_id), daemon=True
             ).start()
         return "OK", 200
 

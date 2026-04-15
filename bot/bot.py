@@ -277,6 +277,29 @@ class BotDB:
             )
             self.conn.commit()
 
+    def sync_nicknames(self, gid, mm):
+        """Update stored Sir/exclusion nicknames from the current member map."""
+        with self._lock:
+            for table in ("sirs", "exclusions"):
+                rows = self.conn.execute(
+                    f"SELECT user_id, nickname FROM {table} WHERE group_id=?", (gid,)
+                ).fetchall()
+                for uid, old_nick in rows:
+                    current = mm.get(uid)
+                    if current and current != old_nick:
+                        self.conn.execute(
+                            f"UPDATE {table} SET nickname=? WHERE group_id=? AND user_id=?",
+                            (current, gid, uid),
+                        )
+                # Also remove members who left the group
+                for uid, _ in rows:
+                    if uid not in mm:
+                        self.conn.execute(
+                            f"DELETE FROM {table} WHERE group_id=? AND user_id=?",
+                            (gid, uid),
+                        )
+            self.conn.commit()
+
     def save_last_check(self, gid, not_liked_names, msg_preview):
         with self._lock:
             self.conn.execute(
@@ -348,12 +371,14 @@ def find_member_by_name(mm, name):
 
 
 def get_context():
-    """Get common context (api, db, sirs, exclusions, member_map) in one call."""
+    """Get common context (api, db, sirs, exclusions, member_map) in one call.
+    Also syncs stored nicknames with current group data."""
     api = get_api()
     db = get_db()
+    mm = api.get_member_map(GROUP_ID)
+    db.sync_nicknames(GROUP_ID, mm)
     sirs = db.get_sirs(GROUP_ID)
     excl = db.get_exclusions(GROUP_ID)
-    mm = api.get_member_map(GROUP_ID)
     return api, db, sirs, excl, mm
 
 

@@ -50,7 +50,14 @@ PORT = int(os.environ.get("PORT", 5000))
 API_BASE = "https://api.groupme.com/v3"
 BOT_POST_URL = "https://api.groupme.com/v3/bots/post"
 
-CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".binger_bot")
+# Use RAILWAY_VOLUME_MOUNT_PATH if available (persistent storage),
+# otherwise fall back to home directory
+_volume = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "")
+CONFIG_DIR = (
+    os.path.join(_volume, "binger_bot")
+    if _volume
+    else os.path.join(os.path.expanduser("~"), ".binger_bot")
+)
 DB_FILE = os.path.join(CONFIG_DIR, "bot.db")
 
 app = Flask(__name__)
@@ -578,25 +585,28 @@ def cmd_check_reply(reply_message_id):
     api_inst, db_inst, sirs, excl, mm = get_context()
     sir_ids = set(sirs.keys())
     excl_ids = set(excl.keys())
+    # Sirs are NEVER checked for likes -- universal exclusion
     active_ids = {uid for uid in mm if uid not in excl_ids and uid not in sir_ids}
 
     msg = api_inst.get_message_by_id(GROUP_ID, reply_message_id)
     if not msg:
         send_bot_message("Could not find the replied-to message.")
         return
+    # Also exclude the message sender from non-likers
+    sender_id = msg.get("user_id", "")
+    active_ids.discard(sender_id)
 
     liked_ids = set(msg.get("favorited_by", []))
-    sender_id = msg.get("user_id", "")
     not_liked = [
         mm[u]
         for u in sorted(active_ids, key=lambda u: mm[u].lower())
-        if u not in liked_ids and u != sender_id
+        if u not in liked_ids
     ]
 
     sender = msg.get("name", "?")
     text = (msg.get("text") or "(media)")[:50]
     ts = datetime.fromtimestamp(msg.get("created_at", 0)).strftime("%m/%d %H:%M")
-    total = len(active_ids) - (1 if sender_id in active_ids else 0)
+    total = len(active_ids)
     lk = total - len(not_liked)
     pct = (lk / total * 100) if total > 0 else 0
 
@@ -732,6 +742,26 @@ def cmd_report(name):
     send_bot_message("\n".join(lines))
 
 
+def cmd_debug(_args):
+    """Show bot state for debugging."""
+    db = get_db()
+    sirs = db.get_sirs(GROUP_ID)
+    excl = db.get_exclusions(GROUP_ID)
+    mm = get_api().get_member_map(GROUP_ID)
+    sir_ids = set(sirs.keys())
+    excl_ids = set(excl.keys())
+    active = {uid for uid in mm if uid not in excl_ids and uid not in sir_ids}
+    lines = [
+        "BINGER DEBUG",
+        f"DB: {DB_FILE}",
+        f"Group members: {len(mm)}",
+        f"Sirs ({len(sirs)}): {', '.join(sirs.values()) or 'none'}",
+        f"Excluded ({len(excl)}): {', '.join(excl.values()) or 'none'}",
+        f"Checkable members: {len(active)}",
+    ]
+    send_bot_message("\n".join(lines))
+
+
 def cmd_shame(_args):
     db = get_db()
     not_liked, preview = db.get_last_check(GROUP_ID)
@@ -767,6 +797,7 @@ COMMANDS = {
     "!leaderboard": cmd_leaderboard,
     "!report": cmd_report,
     "!shame": cmd_shame,
+    "!debug": cmd_debug,
 }
 
 
